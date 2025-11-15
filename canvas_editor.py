@@ -2903,11 +2903,17 @@ class CanvasEditor(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         
-        for item in self.scene.items():
-            if isinstance(item, DraggableImageItem):
+        # Limpiar guías smart antes de eliminar items
+        if hasattr(self, 'smart_guides'):
+            self.smart_guides.clear_guides()
+        
+        # Eliminar todos los items del canvas
+        for item in list(self.scene.items()):  # Usar list() para evitar modificar durante iteración
+            if isinstance(item, (DraggableImageItem, DraggableTextItem)):
                 self.scene.removeItem(item)
         
         self.canvas_images.clear()
+        self.text_items.clear()  # También limpiar textos
         
         if template_name == "4x4":
             self.apply_photo_grid_template(2, 2, 3.5, 4.5, 0.5, 0.5)
@@ -2935,11 +2941,17 @@ class CanvasEditor(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         
-        for item in self.scene.items():
-            if isinstance(item, DraggableImageItem):
+        # Limpiar guías smart antes de eliminar items
+        if hasattr(self, 'smart_guides'):
+            self.smart_guides.clear_guides()
+        
+        # Eliminar todos los items del canvas
+        for item in list(self.scene.items()):  # Usar list() para evitar modificar durante iteración
+            if isinstance(item, (DraggableImageItem, DraggableTextItem)):
                 self.scene.removeItem(item)
         
         self.canvas_images.clear()
+        self.text_items.clear()  # También limpiar textos
         
         self.apply_photo_grid_template(
             template.cols,
