@@ -121,6 +121,59 @@ class TemplatePreset:
     margin_cm: float
     spacing_cm: float = 0.5
 
+@dataclass
+class TextCanvasItem:
+    """Objeto de texto en el canvas con todas sus propiedades"""
+    text: str
+    x: float
+    y: float
+    width: float  # Ancho de la caja de texto en cm
+    height: float  # Alto en cm (auto-ajustable)
+    
+    # Tipografía
+    font_family: str = "Arial"
+    font_size: float = 16.0  # En puntos
+    font_weight: str = "normal"  # normal, bold, light, black
+    font_style: str = "normal"  # normal, italic, oblique
+    
+    # Color y apariencia
+    color: str = "#000000"
+    background_color: str = "transparent"
+    background_opacity: float = 0.0
+    
+    # Alineación y espaciado
+    alignment: str = "left"  # left, center, right, justify
+    line_height: float = 1.2  # Múltiplo del tamaño de fuente
+    letter_spacing: float = 0.0  # En puntos
+    
+    # Decoración
+    underline: bool = False
+    strikethrough: bool = False
+    text_transform: str = "none"  # none, uppercase, lowercase, capitalize
+    
+    # Efectos
+    shadow_enabled: bool = False
+    shadow_offset_x: float = 2.0
+    shadow_offset_y: float = 2.0
+    shadow_blur: float = 4.0
+    shadow_color: str = "#00000080"
+    
+    outline_enabled: bool = False
+    outline_width: float = 1.0
+    outline_color: str = "#000000"
+    
+    # Transformación
+    rotation: float = 0
+    opacity: float = 1.0
+    z_index: int = 0
+    
+    # Estado
+    locked: bool = False
+    visible: bool = True
+    editable: bool = True  # Si está en modo edición
+    
+    uuid: str = field(default_factory=lambda: str(uuid.uuid4()))
+
 # ==================== Item Gráfico Arrastrable ====================
 
 class DraggableImageItem(QGraphicsPixmapItem):
@@ -547,6 +600,264 @@ class DraggableImageItem(QGraphicsPixmapItem):
         elif action == to_back:
             self.canvas_editor.send_to_back()
 
+# ==================== Item de Texto Arrastrable ====================
+
+class DraggableTextItem(QGraphicsTextItem):
+    """Item de texto editable, arrastrable y estilizable"""
+    
+    def __init__(self, text_item: TextCanvasItem, canvas_editor, parent=None):
+        super().__init__(parent)
+        self.text_item = text_item
+        self.canvas_editor = canvas_editor
+        
+        # Configuración inicial
+        self.setPlainText(text_item.text)
+        self.setDefaultTextColor(QColor(text_item.color))
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        
+        # Aplicar fuente
+        font = QFont(text_item.font_family, int(text_item.font_size))
+        font.setBold(text_item.font_weight == "bold")
+        font.setItalic(text_item.font_style == "italic")
+        font.setUnderline(text_item.underline)
+        font.setStrikeOut(text_item.strikethrough)
+        self.setFont(font)
+        
+        # Alineación
+        self.apply_alignment()
+        
+        # Transformaciones
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not text_item.locked)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.setAcceptHoverEvents(True)
+        self.setOpacity(text_item.opacity)
+        self.setZValue(text_item.z_index)
+        self.setRotation(text_item.rotation)
+        
+        # Tamaño de caja
+        self.setTextWidth(cm_to_pixels(text_item.width, canvas_editor.canvas_dpi))
+        
+        # Estado
+        self.is_editing = False
+        self.handle_size = 12
+    
+    def apply_alignment(self):
+        """Aplicar alineación de texto"""
+        cursor = self.textCursor()
+        text_format = QTextBlockFormat()
+        if self.text_item.alignment == "center":
+            text_format.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        elif self.text_item.alignment == "right":
+            text_format.setAlignment(Qt.AlignmentFlag.AlignRight)
+        elif self.text_item.alignment == "justify":
+            text_format.setAlignment(Qt.AlignmentFlag.AlignJustify)
+        else:
+            text_format.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.mergeBlockFormat(text_format)
+        self.setTextCursor(cursor)
+        cursor.clearSelection()
+        self.setTextCursor(cursor)
+    
+    def mouseDoubleClickEvent(self, event):
+        """Doble click → Modo edición"""
+        if not self.text_item.locked and event.button() == Qt.MouseButton.LeftButton:
+            self.enter_edit_mode()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
+    
+    def enter_edit_mode(self):
+        """Activar edición de texto"""
+        self.is_editing = True
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextEditorInteraction
+        )
+        self.setFocus()
+        
+        # Seleccionar todo el texto
+        cursor = self.textCursor()
+        cursor.select(QTextCursor.SelectionType.Document)
+        self.setTextCursor(cursor)
+        
+        # Cambiar cursor del item
+        self.setCursor(Qt.CursorShape.IBeamCursor)
+        
+        # Notificar al editor
+        self.canvas_editor.statusBar().showMessage("Modo edición - Presiona Esc para salir", 0)
+    
+    def exit_edit_mode(self):
+        """Salir de modo edición"""
+        self.is_editing = False
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.clearFocus()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        
+        # Actualizar texto en text_item
+        self.text_item.text = self.toPlainText()
+        
+        # Actualizar altura si cambió
+        doc_height_px = self.document().size().height()
+        self.text_item.height = pixels_to_cm(doc_height_px, self.canvas_editor.canvas_dpi)
+        
+        self.canvas_editor.save_history_state()
+        self.canvas_editor.statusBar().showMessage("Texto actualizado", 2000)
+    
+    def keyPressEvent(self, event):
+        """Manejar teclas en modo edición"""
+        if self.is_editing:
+            if event.key() == Qt.Key.Key_Escape:
+                self.exit_edit_mode()
+                event.accept()
+                return
+            # Permitir edición normal
+            super().keyPressEvent(event)
+        else:
+            # Pasar evento al canvas
+            event.ignore()
+    
+    def focusOutEvent(self, event):
+        """Salir de edición al perder foco"""
+        if self.is_editing:
+            self.exit_edit_mode()
+        super().focusOutEvent(event)
+    
+    def paint(self, painter, option, widget):
+        """Dibujar texto con efectos y controles"""
+        # Eliminar borde automático de Qt
+        option.state &= ~QStyle.StateFlag.State_Selected
+        
+        # Dibujar fondo si está habilitado
+        if self.text_item.background_color != "transparent":
+            painter.save()
+            painter.setBrush(QBrush(QColor(self.text_item.background_color)))
+            painter.setOpacity(self.text_item.background_opacity)
+            painter.drawRect(self.boundingRect())
+            painter.restore()
+        
+        # Dibujar texto
+        super().paint(painter, option, widget)
+        
+        # Dibujar borde de selección y handles si está seleccionado
+        if self.isSelected() and not self.is_editing:
+            self.draw_selection_border(painter)
+    
+    def draw_selection_border(self, painter):
+        """Dibujar borde y handles cuando está seleccionado"""
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        rect = self.boundingRect()
+        
+        # Color turquesa profesional
+        canva_color = QColor(0, 196, 204)
+        
+        # Borde
+        pen = QPen(canva_color, 2, Qt.PenStyle.SolidLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(rect)
+        
+        # Handles en esquinas y lados (similar a imágenes)
+        painter.setBrush(QBrush(QColor(255, 255, 255)))
+        painter.setPen(QPen(canva_color, 2))
+        
+        handle_size = self.handle_size
+        
+        # Handles de esquinas
+        corners = [
+            QPointF(rect.left(), rect.top()),
+            QPointF(rect.right(), rect.top()),
+            QPointF(rect.left(), rect.bottom()),
+            QPointF(rect.right(), rect.bottom()),
+        ]
+        
+        for corner in corners:
+            painter.drawEllipse(corner, handle_size/2, handle_size/2)
+        
+        # Handles de lados
+        sides = [
+            QPointF((rect.left() + rect.right())/2, rect.top()),
+            QPointF((rect.left() + rect.right())/2, rect.bottom()),
+            QPointF(rect.left(), (rect.top() + rect.bottom())/2),
+            QPointF(rect.right(), (rect.top() + rect.bottom())/2),
+        ]
+        
+        for side in sides:
+            painter.drawEllipse(side, handle_size/2, handle_size/2)
+        
+        painter.restore()
+    
+    def itemChange(self, change, value):
+        """Manejar cambios en el item"""
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            if hasattr(self, 'text_item') and hasattr(self.canvas_editor, 'canvas_dpi'):
+                dpi = self.canvas_editor.canvas_dpi
+                pos = self.pos()
+                self.text_item.x = pixels_to_cm(pos.x(), dpi)
+                self.text_item.y = pixels_to_cm(pos.y(), dpi)
+        
+        return super().itemChange(change, value)
+    
+    def contextMenuEvent(self, event):
+        """Menú contextual para texto"""
+        if self.text_item.locked:
+            return
+        
+        menu = QMenu()
+        
+        edit_action = menu.addAction("✏️ Editar Texto")
+        menu.addSeparator()
+        
+        # Estilo
+        style_menu = menu.addMenu("🎨 Estilo")
+        bold_action = style_menu.addAction("Negrita")
+        bold_action.setCheckable(True)
+        bold_action.setChecked(self.text_item.font_weight == "bold")
+        
+        italic_action = style_menu.addAction("Cursiva")
+        italic_action.setCheckable(True)
+        italic_action.setChecked(self.text_item.font_style == "italic")
+        
+        underline_action = style_menu.addAction("Subrayado")
+        underline_action.setCheckable(True)
+        underline_action.setChecked(self.text_item.underline)
+        
+        menu.addSeparator()
+        
+        # Alineación
+        align_menu = menu.addMenu("⬌ Alineación")
+        align_left = align_menu.addAction("⬅️ Izquierda")
+        align_center = align_menu.addAction("↔️ Centro")
+        align_right = align_menu.addAction("➡️ Derecha")
+        
+        menu.addSeparator()
+        
+        duplicate_action = menu.addAction("📋 Duplicar")
+        delete_action = menu.addAction("🗑️ Eliminar")
+        
+        action = menu.exec(event.screenPos())
+        
+        if action == edit_action:
+            self.enter_edit_mode()
+        elif action == bold_action:
+            self.canvas_editor.toggle_text_bold_for_item(self)
+        elif action == italic_action:
+            self.canvas_editor.toggle_text_italic_for_item(self)
+        elif action == underline_action:
+            self.canvas_editor.toggle_text_underline_for_item(self)
+        elif action == align_left:
+            self.canvas_editor.set_text_alignment_for_item(self, "left")
+        elif action == align_center:
+            self.canvas_editor.set_text_alignment_for_item(self, "center")
+        elif action == align_right:
+            self.canvas_editor.set_text_alignment_for_item(self, "right")
+        elif action == duplicate_action:
+            self.canvas_editor.duplicate_text_item(self)
+        elif action == delete_action:
+            self.canvas_editor.delete_text_item(self)
+
 # ==================== Editor de Plantillas ====================
 
 class TemplateEditorDialog(QDialog):
@@ -785,6 +1096,9 @@ class CanvasEditor(QMainWindow):
         self.canvas_images: List[CanvasImageItem] = []
         self.loaded_images: List[str] = []
         
+        # Textos en el canvas
+        self.text_items: List[TextCanvasItem] = []
+        
         # Zoom
         self.zoom_factor = 1.0
         
@@ -959,6 +1273,9 @@ class CanvasEditor(QMainWindow):
         templates_layout.addLayout(template_btns)
         templates_group.setLayout(templates_layout)
         
+        # Herramientas de texto
+        text_group = self.setup_text_tool_ui()
+        
         # Opciones de vista
         view_group = QGroupBox("👁️ Vista")
         view_layout = QVBoxLayout()
@@ -980,6 +1297,7 @@ class CanvasEditor(QMainWindow):
         left_panel.addWidget(config_group)
         left_panel.addWidget(apply_canvas_btn)
         left_panel.addWidget(images_group)
+        left_panel.addWidget(text_group)
         left_panel.addWidget(templates_group)
         left_panel.addWidget(view_group)
         left_panel.addStretch()
@@ -2565,6 +2883,304 @@ class CanvasEditor(QMainWindow):
             self.canvas_dpi = 150
         elif "300" in dpi_text:
             self.canvas_dpi = 300
+    
+    def setup_text_tool_ui(self):
+        """Panel de herramientas de texto"""
+        text_group = QGroupBox("✏️ Herramientas de Texto")
+        text_layout = QVBoxLayout()
+        
+        # Botón para agregar texto
+        add_text_btn = QPushButton("➕ Agregar Texto")
+        add_text_btn.clicked.connect(self.add_text_to_canvas)
+        add_text_btn.setStyleSheet("""
+            QPushButton {
+                background: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background: #45a049;
+            }
+        """)
+        
+        # Propiedades de texto (cuando hay texto seleccionado)
+        text_props_widget = QWidget()
+        text_props_layout = QFormLayout()
+        
+        self.text_font_combo = QFontComboBox()
+        self.text_font_combo.currentFontChanged.connect(self.update_text_font)
+        
+        self.text_size_spin = QSpinBox()
+        self.text_size_spin.setRange(6, 200)
+        self.text_size_spin.setValue(16)
+        self.text_size_spin.setSuffix(" pt")
+        self.text_size_spin.valueChanged.connect(self.update_text_size)
+        
+        self.text_color_btn = QPushButton("Color")
+        self.text_color_btn.clicked.connect(self.choose_text_color)
+        
+        # Botones de estilo
+        style_layout = QHBoxLayout()
+        
+        self.text_bold_btn = QPushButton("B")
+        self.text_bold_btn.setCheckable(True)
+        self.text_bold_btn.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        self.text_bold_btn.clicked.connect(self.toggle_text_bold)
+        self.text_bold_btn.setMaximumWidth(30)
+        
+        self.text_italic_btn = QPushButton("I")
+        self.text_italic_btn.setCheckable(True)
+        font = QFont("Arial", 10)
+        font.setItalic(True)
+        self.text_italic_btn.setFont(font)
+        self.text_italic_btn.clicked.connect(self.toggle_text_italic)
+        self.text_italic_btn.setMaximumWidth(30)
+        
+        self.text_underline_btn = QPushButton("U")
+        self.text_underline_btn.setCheckable(True)
+        font = QFont("Arial", 10)
+        font.setUnderline(True)
+        self.text_underline_btn.setFont(font)
+        self.text_underline_btn.clicked.connect(self.toggle_text_underline)
+        self.text_underline_btn.setMaximumWidth(30)
+        
+        style_layout.addWidget(self.text_bold_btn)
+        style_layout.addWidget(self.text_italic_btn)
+        style_layout.addWidget(self.text_underline_btn)
+        
+        # Alineación
+        align_layout = QHBoxLayout()
+        
+        self.text_align_left_btn = QPushButton("⬅️")
+        self.text_align_left_btn.clicked.connect(lambda: self.set_text_alignment("left"))
+        self.text_align_left_btn.setMaximumWidth(30)
+        
+        self.text_align_center_btn = QPushButton("↔️")
+        self.text_align_center_btn.clicked.connect(lambda: self.set_text_alignment("center"))
+        self.text_align_center_btn.setMaximumWidth(30)
+        
+        self.text_align_right_btn = QPushButton("➡️")
+        self.text_align_right_btn.clicked.connect(lambda: self.set_text_alignment("right"))
+        self.text_align_right_btn.setMaximumWidth(30)
+        
+        align_layout.addWidget(self.text_align_left_btn)
+        align_layout.addWidget(self.text_align_center_btn)
+        align_layout.addWidget(self.text_align_right_btn)
+        
+        text_props_layout.addRow("Fuente:", self.text_font_combo)
+        text_props_layout.addRow("Tamaño:", self.text_size_spin)
+        text_props_layout.addRow("Color:", self.text_color_btn)
+        text_props_layout.addRow("Estilo:", style_layout)
+        text_props_layout.addRow("Alineación:", align_layout)
+        
+        text_props_widget.setLayout(text_props_layout)
+        text_props_widget.setEnabled(False)  # Habilitar cuando haya texto seleccionado
+        self.text_props_widget = text_props_widget
+        
+        text_layout.addWidget(add_text_btn)
+        text_layout.addWidget(text_props_widget)
+        text_group.setLayout(text_layout)
+        
+        return text_group
+    
+    def add_text_to_canvas(self):
+        """Agregar nuevo texto al canvas"""
+        # Posición central del canvas
+        x_cm = self.canvas_width_cm / 2 - 5
+        y_cm = self.canvas_height_cm / 2 - 1
+        
+        text_item = TextCanvasItem(
+            text="Doble click para editar",
+            x=x_cm,
+            y=y_cm,
+            width=10.0,  # 10 cm de ancho
+            height=2.0,
+            font_size=24.0,
+            z_index=len(self.canvas_images) + len(self.text_items)
+        )
+        
+        graphic_text = DraggableTextItem(text_item, self)
+        x_px = cm_to_pixels(x_cm, self.canvas_dpi)
+        y_px = cm_to_pixels(y_cm, self.canvas_dpi)
+        graphic_text.setPos(x_px, y_px)
+        
+        self.scene.addItem(graphic_text)
+        self.text_items.append(text_item)
+        
+        # Auto-entrar en modo edición
+        graphic_text.enter_edit_mode()
+        
+        self.save_history_state()
+        self.statusBar().showMessage("Texto agregado - Doble click para editar", 3000)
+    
+    def get_selected_text_items(self):
+        """Obtener textos seleccionados"""
+        return [item for item in self.scene.selectedItems() if isinstance(item, DraggableTextItem)]
+    
+    def update_text_font(self, font):
+        """Actualizar fuente del texto seleccionado"""
+        selected = self.get_selected_text_items()
+        for item in selected:
+            item.text_item.font_family = font.family()
+            current_font = item.font()
+            current_font.setFamily(font.family())
+            item.setFont(current_font)
+        if selected:
+            self.save_history_state()
+    
+    def update_text_size(self, size):
+        """Actualizar tamaño del texto seleccionado"""
+        selected = self.get_selected_text_items()
+        for item in selected:
+            item.text_item.font_size = size
+            current_font = item.font()
+            current_font.setPointSize(size)
+            item.setFont(current_font)
+        if selected:
+            self.save_history_state()
+    
+    def choose_text_color(self):
+        """Elegir color de texto"""
+        selected = self.get_selected_text_items()
+        if not selected:
+            return
+        
+        color = QColorDialog.getColor()
+        if color.isValid():
+            for item in selected:
+                item.text_item.color = color.name()
+                item.setDefaultTextColor(color)
+            self.save_history_state()
+    
+    def toggle_text_bold(self):
+        """Toggle negrita"""
+        selected = self.get_selected_text_items()
+        for item in selected:
+            if item.text_item.font_weight == "bold":
+                item.text_item.font_weight = "normal"
+            else:
+                item.text_item.font_weight = "bold"
+            
+            current_font = item.font()
+            current_font.setBold(item.text_item.font_weight == "bold")
+            item.setFont(current_font)
+        if selected:
+            self.save_history_state()
+    
+    def toggle_text_italic(self):
+        """Toggle cursiva"""
+        selected = self.get_selected_text_items()
+        for item in selected:
+            if item.text_item.font_style == "italic":
+                item.text_item.font_style = "normal"
+            else:
+                item.text_item.font_style = "italic"
+            
+            current_font = item.font()
+            current_font.setItalic(item.text_item.font_style == "italic")
+            item.setFont(current_font)
+        if selected:
+            self.save_history_state()
+    
+    def toggle_text_underline(self):
+        """Toggle subrayado"""
+        selected = self.get_selected_text_items()
+        for item in selected:
+            item.text_item.underline = not item.text_item.underline
+            current_font = item.font()
+            current_font.setUnderline(item.text_item.underline)
+            item.setFont(current_font)
+        if selected:
+            self.save_history_state()
+    
+    def set_text_alignment(self, alignment):
+        """Establecer alineación de texto"""
+        selected = self.get_selected_text_items()
+        for item in selected:
+            item.text_item.alignment = alignment
+            item.apply_alignment()
+        if selected:
+            self.save_history_state()
+    
+    # Métodos auxiliares para menú contextual de texto
+    def toggle_text_bold_for_item(self, item):
+        """Toggle negrita para un item específico"""
+        if item.text_item.font_weight == "bold":
+            item.text_item.font_weight = "normal"
+        else:
+            item.text_item.font_weight = "bold"
+        
+        current_font = item.font()
+        current_font.setBold(item.text_item.font_weight == "bold")
+        item.setFont(current_font)
+        self.save_history_state()
+    
+    def toggle_text_italic_for_item(self, item):
+        """Toggle cursiva para un item específico"""
+        if item.text_item.font_style == "italic":
+            item.text_item.font_style = "normal"
+        else:
+            item.text_item.font_style = "italic"
+        
+        current_font = item.font()
+        current_font.setItalic(item.text_item.font_style == "italic")
+        item.setFont(current_font)
+        self.save_history_state()
+    
+    def toggle_text_underline_for_item(self, item):
+        """Toggle subrayado para un item específico"""
+        item.text_item.underline = not item.text_item.underline
+        current_font = item.font()
+        current_font.setUnderline(item.text_item.underline)
+        item.setFont(current_font)
+        self.save_history_state()
+    
+    def set_text_alignment_for_item(self, item, alignment):
+        """Establecer alineación para un item específico"""
+        item.text_item.alignment = alignment
+        item.apply_alignment()
+        self.save_history_state()
+    
+    def duplicate_text_item(self, item):
+        """Duplicar un texto"""
+        new_text = TextCanvasItem(
+            text=item.text_item.text,
+            x=item.text_item.x + 1.0,
+            y=item.text_item.y + 1.0,
+            width=item.text_item.width,
+            height=item.text_item.height,
+            font_family=item.text_item.font_family,
+            font_size=item.text_item.font_size,
+            font_weight=item.text_item.font_weight,
+            font_style=item.text_item.font_style,
+            color=item.text_item.color,
+            alignment=item.text_item.alignment,
+            underline=item.text_item.underline,
+            strikethrough=item.text_item.strikethrough,
+            rotation=item.text_item.rotation,
+            opacity=item.text_item.opacity,
+            z_index=len(self.canvas_images) + len(self.text_items)
+        )
+        
+        graphic_text = DraggableTextItem(new_text, self)
+        x_px = cm_to_pixels(new_text.x, self.canvas_dpi)
+        y_px = cm_to_pixels(new_text.y, self.canvas_dpi)
+        graphic_text.setPos(x_px, y_px)
+        
+        self.scene.addItem(graphic_text)
+        self.text_items.append(new_text)
+        self.save_history_state()
+        self.statusBar().showMessage("Texto duplicado", 2000)
+    
+    def delete_text_item(self, item):
+        """Eliminar un texto"""
+        self.scene.removeItem(item)
+        if item.text_item in self.text_items:
+            self.text_items.remove(item.text_item)
+        self.save_history_state()
+        self.statusBar().showMessage("Texto eliminado", 2000)
     
     def recreate_canvas(self):
         """Recrear canvas con nueva configuración"""
