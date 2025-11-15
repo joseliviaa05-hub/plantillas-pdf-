@@ -4,18 +4,21 @@ Editor de Canvas Profesional - Versión Completa
 Sistema completo de edición de imágenes con canvas profesional
 """
 
-import sys, os, tempfile, uuid, json, random
+import json
+import os
+import random
+import sys
+import tempfile
+import uuid
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Set, Dict
-from PyQt6.QtWidgets import *
-from PyQt6.QtGui import *
+from typing import List, Optional, Tuple
+
+from PIL import Image, ImageQt
 from PyQt6.QtCore import *
-from PyPDF2 import PdfReader, PdfWriter, PdfMerger
-import fitz
+from PyQt6.QtGui import *
+from PyQt6.QtWidgets import *
+from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas as pdf_canvas
-from reportlab.lib.units import cm
-from reportlab.lib.pagesizes import letter, A4
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageQt
 
 POINTS_PER_CM = 28.346456692913385
 
@@ -574,16 +577,55 @@ class CanvasEditor(QMainWindow):
         QShortcut(QKeySequence.StandardKey.ZoomOut, self, lambda: self.change_zoom(-0.2))
     
     def setup_ui(self):
-        # Widget central
+        """Setup main UI layout"""
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout()
         
-        # === PANEL IZQUIERDO ===
+        # Create three main panels
+        left_widget = self._create_left_panel()
+        center_widget = self._create_center_panel()
+        right_widget = self._create_right_panel()
+        
+        # Assemble main layout
+        main_layout.addWidget(left_widget)
+        main_layout.addWidget(center_widget, 1)
+        main_layout.addWidget(right_widget)
+        
+        central.setLayout(main_layout)
+        self.statusBar().showMessage("Canvas listo ✓")
+    
+    def _create_left_panel(self):
+        """Create left panel with canvas configuration and templates"""
+        left_widget = QWidget()
+        left_widget.setMaximumWidth(320)
         left_panel = QVBoxLayout()
         left_panel.setSpacing(10)
         
-        # Configuración del canvas
+        # Add components
+        config_group = self._create_canvas_config_group()
+        apply_canvas_btn = self._create_apply_canvas_button()
+        images_group = self._create_images_group()
+        templates_group = self._create_templates_group()
+        view_group = self._create_view_options_group()
+        
+        left_panel.addWidget(config_group)
+        left_panel.addWidget(apply_canvas_btn)
+        left_panel.addWidget(images_group)
+        left_panel.addWidget(templates_group)
+        left_panel.addWidget(view_group)
+        left_panel.addStretch()
+        
+        left_widget.setLayout(left_panel)
+        return left_widget
+    
+    def _create_canvas_config_group(self):
+        """Create canvas configuration group"""
+        config_group = QGroupBox("📄 Configuración del Canvas")
+        config_layout = QFormLayout()
+        
+    def _create_canvas_config_group(self):
+        """Create canvas configuration group"""
         config_group = QGroupBox("📄 Configuración del Canvas")
         config_layout = QFormLayout()
         
@@ -626,13 +668,22 @@ class CanvasEditor(QMainWindow):
         config_layout.addRow("Alto:", self.custom_height)
         config_layout.addRow("Calidad:", self.dpi_combo)
         
+        config_group.setLayout(config_layout)
+        return config_group
+    
+    def _create_apply_canvas_button(self):
+        """Create apply canvas configuration button"""
         apply_canvas_btn = QPushButton("🔄 Aplicar Configuración")
         apply_canvas_btn.clicked.connect(self.recreate_canvas)
         apply_canvas_btn.setStyleSheet("background: #0078d7; color: white; font-weight: bold; padding: 8px;")
-        
-        config_group.setLayout(config_layout)
-        
-        # Imágenes cargadas
+        return apply_canvas_btn
+    
+    def _create_images_group(self):
+        """Create images group for loading images"""
+        images_group = QGroupBox("🖼️ Imágenes Disponibles")
+        images_layout = QVBoxLayout()
+    def _create_images_group(self):
+        """Create images group for loading images"""
         images_group = QGroupBox("🖼️ Imágenes Disponibles")
         images_layout = QVBoxLayout()
         
@@ -647,12 +698,14 @@ class CanvasEditor(QMainWindow):
         images_layout.addWidget(self.images_list)
         images_layout.addWidget(load_btn)
         images_group.setLayout(images_layout)
-        
-        # Plantillas
+        return images_group
+    
+    def _create_templates_group(self):
+        """Create templates group for quick layouts"""
         templates_group = QGroupBox("📋 Plantillas Rápidas")
         templates_layout = QVBoxLayout()
         
-        # Scroll area para plantillas
+        # Scroll area for templates
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setMaximumHeight(200)
@@ -660,7 +713,7 @@ class CanvasEditor(QMainWindow):
         templates_widget = QWidget()
         templates_inner = QVBoxLayout()
         
-        # Plantillas predefinidas
+        # Predefined templates
         btn_4x4 = QPushButton("📸 4x4 DNI (4 fotos)")
         btn_4x4.clicked.connect(lambda: self.apply_predefined_template("4x4"))
         
@@ -674,7 +727,7 @@ class CanvasEditor(QMainWindow):
         templates_inner.addWidget(btn_2x3)
         templates_inner.addWidget(btn_collage)
         
-        # Plantillas personalizadas
+        # Custom templates
         for template in self.custom_templates:
             btn = QPushButton(f"⭐ {template.name}")
             btn.clicked.connect(lambda checked, t=template: self.apply_custom_template(t))
@@ -684,7 +737,7 @@ class CanvasEditor(QMainWindow):
         templates_widget.setLayout(templates_inner)
         scroll.setWidget(templates_widget)
         
-        # Botones de gestión de plantillas
+        # Template management buttons
         template_btns = QHBoxLayout()
         edit_template_btn = QPushButton("✏️ Editar")
         edit_template_btn.clicked.connect(self.edit_template)
@@ -696,8 +749,10 @@ class CanvasEditor(QMainWindow):
         templates_layout.addWidget(scroll)
         templates_layout.addLayout(template_btns)
         templates_group.setLayout(templates_layout)
-        
-        # Opciones de vista
+        return templates_group
+    
+    def _create_view_options_group(self):
+        """Create view options group"""
         view_group = QGroupBox("👁️ Vista")
         view_layout = QVBoxLayout()
         
@@ -713,21 +768,36 @@ class CanvasEditor(QMainWindow):
         view_layout.addWidget(self.grid_check)
         view_layout.addWidget(self.snap_check)
         view_group.setLayout(view_layout)
-        
-        # Ensamblar panel izquierdo
-        left_panel.addWidget(config_group)
-        left_panel.addWidget(apply_canvas_btn)
-        left_panel.addWidget(images_group)
-        left_panel.addWidget(templates_group)
-        left_panel.addWidget(view_group)
-        left_panel.addStretch()
-        
-        # === PANEL CENTRAL - CANVAS ===
+        return view_group
+    
+    def _create_center_panel(self):
+        """Create center panel with canvas view"""
+        center_widget = QWidget()
         center_layout = QVBoxLayout()
         
-        # Toolbar superior
+        # Toolbar
+        toolbar = self._create_toolbar()
+        
+        # Graphics View for canvas
+        self.scene = QGraphicsScene()
+        self.view = QGraphicsView(self.scene)
+        self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        self.view.setStyleSheet("background: #cccccc;")
+        self.view.setAcceptDrops(True)
+        self.view.viewport().installEventFilter(self)
+        
+        center_layout.addLayout(toolbar)
+        center_layout.addWidget(self.view)
+        center_widget.setLayout(center_layout)
+        return center_widget
+    
+    def _create_toolbar(self):
+        """Create toolbar with zoom and undo/redo controls"""
         toolbar = QHBoxLayout()
         
+        # Zoom controls
         zoom_out_btn = QPushButton("🔍-")
         zoom_out_btn.clicked.connect(lambda: self.change_zoom(-0.2))
         
@@ -757,25 +827,32 @@ class CanvasEditor(QMainWindow):
         toolbar.addWidget(undo_btn)
         toolbar.addWidget(redo_btn)
         
-        # Graphics View para el canvas
-        self.scene = QGraphicsScene()
-        self.view = QGraphicsView(self.scene)
-        self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
-        self.view.setStyleSheet("background: #cccccc;")
-        self.view.setAcceptDrops(True)
-        
-        # Instalar event filter para drag & drop
-        self.view.viewport().installEventFilter(self)
-        
-        center_layout.addLayout(toolbar)
-        center_layout.addWidget(self.view)
-        
-        # === PANEL DERECHO - PROPIEDADES ===
+        return toolbar
+    
+    def _create_right_panel(self):
+        """Create right panel with properties and actions"""
+        right_widget = QWidget()
+        right_widget.setMaximumWidth(300)
         right_panel = QVBoxLayout()
         right_panel.setSpacing(10)
         
+        # Add components
+        props_group = self._create_properties_group()
+        actions_group = self._create_actions_group()
+        layers_group = self._create_layers_group()
+        export_group = self._create_export_group()
+        
+        right_panel.addWidget(props_group)
+        right_panel.addWidget(actions_group)
+        right_panel.addWidget(layers_group)
+        right_panel.addWidget(export_group)
+        right_panel.addStretch()
+        
+        right_widget.setLayout(right_panel)
+        return right_widget
+    
+    def _create_properties_group(self):
+        """Create properties group for selected images"""
         props_group = QGroupBox("⚙️ Propiedades de Imagen")
         props_layout = QFormLayout()
         
@@ -829,8 +906,10 @@ class CanvasEditor(QMainWindow):
         props_layout.addRow("", self.lock_aspect)
         
         props_group.setLayout(props_layout)
-        
-        # Acciones sobre imagen seleccionada
+        return props_group
+    
+    def _create_actions_group(self):
+        """Create actions group for image manipulation"""
         actions_group = QGroupBox("🔧 Acciones")
         actions_layout = QVBoxLayout()
         
@@ -855,8 +934,10 @@ class CanvasEditor(QMainWindow):
         actions_layout.addWidget(btn_to_back)
         actions_layout.addWidget(btn_lock)
         actions_group.setLayout(actions_layout)
-        
-        # Capas
+        return actions_group
+    
+    def _create_layers_group(self):
+        """Create layers group for layer management"""
         layers_group = QGroupBox("📚 Capas")
         layers_layout = QVBoxLayout()
         
@@ -868,8 +949,10 @@ class CanvasEditor(QMainWindow):
         layers_layout.addWidget(QLabel("<i>Arrastra para reordenar</i>"))
         layers_layout.addWidget(self.layers_list)
         layers_group.setLayout(layers_layout)
-        
-        # Exportar
+        return layers_group
+    
+    def _create_export_group(self):
+        """Create export group for canvas export"""
         export_group = QGroupBox("💾 Exportar")
         export_layout = QVBoxLayout()
         
@@ -884,34 +967,7 @@ class CanvasEditor(QMainWindow):
         export_layout.addWidget(self.export_format)
         export_layout.addWidget(btn_export)
         export_group.setLayout(export_layout)
-        
-        # Ensamblar panel derecho
-        right_panel.addWidget(props_group)
-        right_panel.addWidget(actions_group)
-        right_panel.addWidget(layers_group)
-        right_panel.addWidget(export_group)
-        right_panel.addStretch()
-        
-        # === ENSAMBLAR TODO ===
-        left_widget = QWidget()
-        left_widget.setLayout(left_panel)
-        left_widget.setMaximumWidth(320)
-        
-        center_widget = QWidget()
-        center_widget.setLayout(center_layout)
-        
-        right_widget = QWidget()
-        right_widget.setLayout(right_panel)
-        right_widget.setMaximumWidth(300)
-        
-        main_layout.addWidget(left_widget)
-        main_layout.addWidget(center_widget, 1)
-        main_layout.addWidget(right_widget)
-        
-        central.setLayout(main_layout)
-        
-        # Barra de estado
-        self.statusBar().showMessage("Canvas listo ✓")
+        return export_group
     
     def apply_checkbox_style(self, checkbox):
         """Aplicar estilo mejorado a checkbox"""
