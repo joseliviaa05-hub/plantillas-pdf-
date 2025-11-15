@@ -4,18 +4,22 @@ Editor de Canvas Profesional - Versión Completa
 Sistema completo de edición de imágenes con canvas profesional
 """
 
-import sys, os, tempfile, uuid, json, random
+import json
+import math
+import os
+import random
+import sys
+import tempfile
+import uuid
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Set, Dict
-from PyQt6.QtWidgets import *
-from PyQt6.QtGui import *
+from typing import List, Optional, Tuple
+
+from PIL import Image, ImageQt
 from PyQt6.QtCore import *
-from PyPDF2 import PdfReader, PdfWriter, PdfMerger
-import fitz
+from PyQt6.QtGui import *
+from PyQt6.QtWidgets import *
+from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas as pdf_canvas
-from reportlab.lib.units import cm
-from reportlab.lib.pagesizes import letter, A4
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageQt
 
 POINTS_PER_CM = 28.346456692913385
 
@@ -62,7 +66,7 @@ class TemplatePreset:
 # ==================== Item Gráfico Arrastrable ====================
 
 class DraggableImageItem(QGraphicsPixmapItem):
-    """Item de imagen arrastrable y redimensionable en el canvas"""
+    """Item de imagen arrastrable y redimensionable en el canvas - Estilo Canva"""
     
     def __init__(self, pixmap: QPixmap, canvas_item: CanvasImageItem, canvas_editor, parent=None):
         super().__init__(pixmap, parent)
@@ -75,22 +79,36 @@ class DraggableImageItem(QGraphicsPixmapItem):
         self.setOpacity(canvas_item.opacity)
         self.setZValue(canvas_item.z_index)
         
-        # Handles de redimensionamiento
-        self.resize_handle_size = 10
+        # Configuración de handles (estilo Canva)
+        self.handle_size = 12
+        self.handle_color = QColor(255, 255, 255)
+        self.handle_border_color = QColor(0, 196, 204)  # Cyan de Canva
+        self.handle_border_width = 2
+        self.handle_hover_scale = 1.3
+        self.rotation_handle_distance = 40  # Distancia del handle de rotación
+        
+        # Estado de interacción
         self.is_resizing = False
+        self.is_rotating = False
         self.resize_corner = None
         self.resize_side = None
         self.resize_start_pos = None
         self.resize_start_rect = None
         self.resize_start_pixmap = None
+        self.hovered_handle = None
         
-        # Rotación
+        # Tooltip de transformación
+        self.tooltip = None
+        
+        # Transformación
         self.setTransformOriginPoint(self.boundingRect().center())
         self.setRotation(canvas_item.rotation)
+        self.setAcceptHoverEvents(True)
         
     def boundingRect(self):
         rect = super().boundingRect()
-        margin = self.resize_handle_size + 2
+        # Expandir para incluir handles y handle de rotación
+        margin = max(self.handle_size + 5, self.rotation_handle_distance + 15)
         return rect.adjusted(-margin, -margin, margin, margin)
     
     def paint(self, painter, option, widget):
@@ -99,51 +117,121 @@ class DraggableImageItem(QGraphicsPixmapItem):
         
         # Dibujar controles si está seleccionado
         if self.isSelected():
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             rect = self.pixmap().rect()
             
-            # Borde de selección animado
-            pen = QPen(QColor(0, 120, 215), 2, Qt.PenStyle.DashLine)
+            # Borde de selección (estilo Canva)
+            pen = QPen(self.handle_border_color, 2)
             painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(rect)
             
-            # Handles en las esquinas (para redimensionar proporcional)
-            handle_size = self.resize_handle_size
-            painter.setBrush(QBrush(QColor(0, 120, 215)))
-            painter.setPen(QPen(QColor(255, 255, 255), 1))
-            
+            # Dibujar handles en las esquinas (circulares, estilo Canva)
             corners = [
-                QRectF(rect.left() - handle_size/2, rect.top() - handle_size/2, handle_size, handle_size),  # TL
-                QRectF(rect.right() - handle_size/2, rect.top() - handle_size/2, handle_size, handle_size),  # TR
-                QRectF(rect.left() - handle_size/2, rect.bottom() - handle_size/2, handle_size, handle_size),  # BL
-                QRectF(rect.right() - handle_size/2, rect.bottom() - handle_size/2, handle_size, handle_size),  # BR
+                ('tl', rect.left(), rect.top()),
+                ('tr', rect.right(), rect.top()),
+                ('bl', rect.left(), rect.bottom()),
+                ('br', rect.right(), rect.bottom()),
             ]
             
-            for corner in corners:
-                painter.drawEllipse(corner)
+            for corner_id, x, y in corners:
+                self._draw_handle(painter, x, y, corner_id)
             
-            # Handles en los lados (para deformar)
+            # Dibujar handles en los lados
             sides = [
-                QRectF((rect.left() + rect.right())/2 - handle_size/2, rect.top() - handle_size/2, handle_size, handle_size),  # T
-                QRectF((rect.left() + rect.right())/2 - handle_size/2, rect.bottom() - handle_size/2, handle_size, handle_size),  # B
-                QRectF(rect.left() - handle_size/2, (rect.top() + rect.bottom())/2 - handle_size/2, handle_size, handle_size),  # L
-                QRectF(rect.right() - handle_size/2, (rect.top() + rect.bottom())/2 - handle_size/2, handle_size, handle_size),  # R
+                ('t', (rect.left() + rect.right()) / 2, rect.top()),
+                ('b', (rect.left() + rect.right()) / 2, rect.bottom()),
+                ('l', rect.left(), (rect.top() + rect.bottom()) / 2),
+                ('r', rect.right(), (rect.top() + rect.bottom()) / 2),
             ]
             
-            painter.setBrush(QBrush(QColor(255, 165, 0)))
-            for side in sides:
-                painter.drawRect(side)
+            for side_id, x, y in sides:
+                self._draw_handle(painter, x, y, side_id)
+            
+            # Dibujar handle de rotación (arriba, estilo Canva)
+            rotation_x = (rect.left() + rect.right()) / 2
+            rotation_y = rect.top() - self.rotation_handle_distance
+            
+            # Línea punteada de conexión
+            pen = QPen(self.handle_border_color, 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawLine(
+                QPointF(rotation_x, rect.top()),
+                QPointF(rotation_x, rotation_y)
+            )
+            
+            # Handle de rotación circular
+            self._draw_rotation_handle(painter, rotation_x, rotation_y)
+    
+    def _draw_handle(self, painter, x, y, handle_id):
+        """Dibuja un handle individual (estilo Canva)"""
+        size = self.handle_size
+        if self.hovered_handle == handle_id:
+            size = int(size * self.handle_hover_scale)
+        
+        # Sombra sutil
+        shadow_offset = 1
+        painter.setBrush(QBrush(QColor(0, 0, 0, 30)))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(
+            QPointF(x + shadow_offset, y + shadow_offset),
+            size / 2, size / 2
+        )
+        
+        # Handle principal
+        painter.setBrush(QBrush(self.handle_color))
+        painter.setPen(QPen(self.handle_border_color, self.handle_border_width))
+        painter.drawEllipse(QPointF(x, y), size / 2, size / 2)
+    
+    def _draw_rotation_handle(self, painter, x, y):
+        """Dibuja el handle de rotación (estilo Canva)"""
+        size = self.handle_size
+        if self.hovered_handle == 'rotation':
+            size = int(size * self.handle_hover_scale)
+        
+        # Sombra
+        shadow_offset = 1
+        painter.setBrush(QBrush(QColor(0, 0, 0, 30)))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(
+            QPointF(x + shadow_offset, y + shadow_offset),
+            size / 2, size / 2
+        )
+        
+        # Handle con ícono de rotación
+        painter.setBrush(QBrush(self.handle_color))
+        painter.setPen(QPen(self.handle_border_color, self.handle_border_width))
+        painter.drawEllipse(QPointF(x, y), size / 2, size / 2)
+        
+        # Dibujar símbolo de rotación (flechas curvas)
+        painter.setPen(QPen(self.handle_border_color, 1.5))
+        arrow_size = size * 0.4
+        painter.drawArc(
+            QRectF(x - arrow_size, y - arrow_size, arrow_size * 2, arrow_size * 2),
+            30 * 16, 300 * 16
+        )
     
     def get_handle_at_pos(self, pos):
         """Determinar qué handle se clickeó"""
         rect = self.pixmap().rect()
-        handle_size = self.resize_handle_size
+        handle_size = self.handle_size
+        
+        # Handle de rotación (comprobar primero)
+        rotation_x = (rect.left() + rect.right()) / 2
+        rotation_y = rect.top() - self.rotation_handle_distance
+        rotation_rect = QRectF(
+            rotation_x - handle_size, rotation_y - handle_size,
+            handle_size * 2, handle_size * 2
+        )
+        if rotation_rect.contains(pos):
+            return ('rotation', 'rotation')
         
         # Esquinas (redimensionar proporcional)
         corners = {
-            'tl': QRectF(rect.left() - handle_size/2, rect.top() - handle_size/2, handle_size, handle_size),
-            'tr': QRectF(rect.right() - handle_size/2, rect.top() - handle_size/2, handle_size, handle_size),
-            'bl': QRectF(rect.left() - handle_size/2, rect.bottom() - handle_size/2, handle_size, handle_size),
-            'br': QRectF(rect.right() - handle_size/2, rect.bottom() - handle_size/2, handle_size, handle_size),
+            'tl': QRectF(rect.left() - handle_size, rect.top() - handle_size, handle_size * 2, handle_size * 2),
+            'tr': QRectF(rect.right() - handle_size, rect.top() - handle_size, handle_size * 2, handle_size * 2),
+            'bl': QRectF(rect.left() - handle_size, rect.bottom() - handle_size, handle_size * 2, handle_size * 2),
+            'br': QRectF(rect.right() - handle_size, rect.bottom() - handle_size, handle_size * 2, handle_size * 2),
         }
         
         for corner, handle_rect in corners.items():
@@ -152,10 +240,10 @@ class DraggableImageItem(QGraphicsPixmapItem):
         
         # Lados (deformar)
         sides = {
-            't': QRectF((rect.left() + rect.right())/2 - handle_size/2, rect.top() - handle_size/2, handle_size, handle_size),
-            'b': QRectF((rect.left() + rect.right())/2 - handle_size/2, rect.bottom() - handle_size/2, handle_size, handle_size),
-            'l': QRectF(rect.left() - handle_size/2, (rect.top() + rect.bottom())/2 - handle_size/2, handle_size, handle_size),
-            'r': QRectF(rect.right() - handle_size/2, (rect.top() + rect.bottom())/2 - handle_size/2, handle_size, handle_size),
+            't': QRectF((rect.left() + rect.right())/2 - handle_size, rect.top() - handle_size, handle_size * 2, handle_size * 2),
+            'b': QRectF((rect.left() + rect.right())/2 - handle_size, rect.bottom() - handle_size, handle_size * 2, handle_size * 2),
+            'l': QRectF(rect.left() - handle_size, (rect.top() + rect.bottom())/2 - handle_size, handle_size * 2, handle_size * 2),
+            'r': QRectF(rect.right() - handle_size, (rect.top() + rect.bottom())/2 - handle_size, handle_size * 2, handle_size * 2),
         }
         
         for side, handle_rect in sides.items():
@@ -164,30 +252,125 @@ class DraggableImageItem(QGraphicsPixmapItem):
         
         return (None, None)
     
+    def hoverMoveEvent(self, event):
+        """Actualizar handle hover y cursor"""
+        if not self.isSelected():
+            super().hoverMoveEvent(event)
+            return
+        
+        pos = event.pos()
+        handle_type, handle_pos = self.get_handle_at_pos(pos)
+        
+        # Actualizar handle hover
+        old_hover = self.hovered_handle
+        self.hovered_handle = handle_pos if handle_type else None
+        
+        if old_hover != self.hovered_handle:
+            self.update()
+        
+        # Actualizar cursor
+        if handle_type == 'rotation':
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        elif handle_type == 'corner':
+            cursors = {
+                'tl': Qt.CursorShape.SizeFDiagCursor,
+                'tr': Qt.CursorShape.SizeBDiagCursor,
+                'bl': Qt.CursorShape.SizeBDiagCursor,
+                'br': Qt.CursorShape.SizeFDiagCursor,
+            }
+            self.setCursor(cursors.get(handle_pos, Qt.CursorShape.ArrowCursor))
+        elif handle_type == 'side':
+            cursors = {
+                't': Qt.CursorShape.SizeVerCursor,
+                'b': Qt.CursorShape.SizeVerCursor,
+                'l': Qt.CursorShape.SizeHorCursor,
+                'r': Qt.CursorShape.SizeHorCursor,
+            }
+            self.setCursor(cursors.get(handle_pos, Qt.CursorShape.ArrowCursor))
+        else:
+            self.setCursor(Qt.CursorShape.SizeAllCursor if not self.canvas_item.locked else Qt.CursorShape.ArrowCursor)
+        
+        super().hoverMoveEvent(event)
+    
+    def hoverLeaveEvent(self, event):
+        """Limpiar hover state"""
+        self.hovered_handle = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
+        super().hoverLeaveEvent(event)
+    
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and not self.canvas_item.locked:
             pos = event.pos()
             handle_type, handle_pos = self.get_handle_at_pos(pos)
             
-            if handle_type:
+            if handle_type == 'rotation':
+                self.is_rotating = True
+                self.resize_start_pos = event.scenePos()
+                # Crear tooltip
+                if not self.tooltip:
+                    self.tooltip = TransformTooltip()
+                    self.scene().addItem(self.tooltip)
+                    self.scene().addItem(self.tooltip.background)
+                event.accept()
+                return
+            elif handle_type:
                 self.is_resizing = True
                 self.resize_corner = handle_pos if handle_type == 'corner' else None
                 self.resize_side = handle_pos if handle_type == 'side' else None
                 self.resize_start_pos = event.scenePos()
                 self.resize_start_rect = self.boundingRect()
                 self.resize_start_pixmap = self.pixmap()
+                # Crear tooltip
+                if not self.tooltip:
+                    self.tooltip = TransformTooltip()
+                    self.scene().addItem(self.tooltip)
+                    self.scene().addItem(self.tooltip.background)
                 event.accept()
                 return
         
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event):
-        if self.is_resizing:
+        if self.is_rotating:
+            # Calcular ángulo de rotación desde el centro
+            center = self.boundingRect().center()
+            scene_pos = event.scenePos()
+            local_center = self.mapToScene(center)
+            
+            angle = math.degrees(math.atan2(
+                scene_pos.y() - local_center.y(),
+                scene_pos.x() - local_center.x()
+            ))
+            
+            # Normalizar ángulo
+            angle = (angle + 90) % 360
+            
+            # Snap a ángulos cardinales con Shift
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                snap_angles = [0, 45, 90, 135, 180, 225, 270, 315]
+                snap_threshold = 10
+                for snap_angle in snap_angles:
+                    if abs(angle - snap_angle) < snap_threshold:
+                        angle = snap_angle
+                        break
+            
+            self.setRotation(angle)
+            self.canvas_item.rotation = angle
+            
+            # Mostrar tooltip con ángulo
+            if self.tooltip:
+                tooltip_pos = self.mapToScene(self.boundingRect().center())
+                self.tooltip.show_at(tooltip_pos.x(), tooltip_pos.y() - 50, f"{int(angle)}°")
+            
+            event.accept()
+            
+        elif self.is_resizing:
             delta = event.scenePos() - self.resize_start_pos
             current_pixmap = self.resize_start_pixmap
             
             if self.resize_corner:
-                # Redimensionar desde esquina (proporcional o no)
+                # Redimensionar desde esquina
                 new_width = max(20, current_pixmap.width())
                 new_height = max(20, current_pixmap.height())
                 
@@ -216,6 +399,15 @@ class DraggableImageItem(QGraphicsPixmapItem):
                 )
                 self.setPixmap(scaled_pixmap)
                 
+                # Mostrar tooltip con dimensiones
+                if self.tooltip:
+                    dpi = self.canvas_editor.canvas_dpi
+                    width_cm = pixels_to_cm(new_width, dpi)
+                    height_cm = pixels_to_cm(new_height, dpi)
+                    tooltip_pos = self.mapToScene(self.boundingRect().center())
+                    self.tooltip.show_at(tooltip_pos.x(), tooltip_pos.y() - 50, 
+                                       f"{width_cm:.1f} × {height_cm:.1f} cm")
+                
             elif self.resize_side:
                 # Deformar desde lado
                 new_width = current_pixmap.width()
@@ -236,13 +428,30 @@ class DraggableImageItem(QGraphicsPixmapItem):
                     Qt.TransformationMode.SmoothTransformation
                 )
                 self.setPixmap(scaled_pixmap)
+                
+                # Mostrar tooltip con dimensiones
+                if self.tooltip:
+                    dpi = self.canvas_editor.canvas_dpi
+                    width_cm = pixels_to_cm(new_width, dpi)
+                    height_cm = pixels_to_cm(new_height, dpi)
+                    tooltip_pos = self.mapToScene(self.boundingRect().center())
+                    self.tooltip.show_at(tooltip_pos.x(), tooltip_pos.y() - 50, 
+                                       f"{width_cm:.1f} × {height_cm:.1f} cm")
             
             event.accept()
         else:
             super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event):
-        if self.is_resizing:
+        if self.is_rotating:
+            self.is_rotating = False
+            self.canvas_editor.update_properties_from_selection()
+            self.canvas_editor.save_history_state()
+            # Ocultar tooltip
+            if self.tooltip:
+                self.tooltip.hide()
+            event.accept()
+        elif self.is_resizing:
             self.is_resizing = False
             # Actualizar canvas_item con nuevo tamaño
             dpi = self.canvas_editor.canvas_dpi
@@ -250,12 +459,32 @@ class DraggableImageItem(QGraphicsPixmapItem):
             self.canvas_item.height = pixels_to_cm(self.pixmap().height(), dpi)
             self.canvas_editor.update_properties_from_selection()
             self.canvas_editor.save_history_state()
+            # Ocultar tooltip
+            if self.tooltip:
+                self.tooltip.hide()
             event.accept()
         else:
             super().mouseReleaseEvent(event)
     
     def itemChange(self, change, value):
-        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            # Aplicar smart guides durante el movimiento
+            if hasattr(self.canvas_editor, 'show_smart_guides') and self.canvas_editor.show_smart_guides:
+                if self.canvas_editor.smart_guides:
+                    snap_x, snap_y = self.canvas_editor.smart_guides.find_snap_positions(self)
+                    
+                    new_pos = value
+                    rect = self.sceneBoundingRect()
+                    center_offset_x = rect.width() / 2
+                    center_offset_y = rect.height() / 2
+                    
+                    if snap_x is not None:
+                        new_pos.setX(snap_x - center_offset_x)
+                    if snap_y is not None:
+                        new_pos.setY(snap_y - center_offset_y)
+                    
+                    return new_pos
+        elif change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             # Actualizar posición en canvas_item
             if hasattr(self, 'canvas_item') and hasattr(self.canvas_editor, 'canvas_dpi'):
                 dpi = self.canvas_editor.canvas_dpi
@@ -263,6 +492,10 @@ class DraggableImageItem(QGraphicsPixmapItem):
                 self.canvas_item.x = pixels_to_cm(pos.x(), dpi)
                 self.canvas_item.y = pixels_to_cm(pos.y(), dpi)
                 self.canvas_editor.update_properties_from_selection()
+            
+            # Limpiar guías cuando termina el movimiento
+            if hasattr(self.canvas_editor, 'smart_guides') and self.canvas_editor.smart_guides:
+                self.canvas_editor.smart_guides.clear_guides()
         
         return super().itemChange(change, value)
     
@@ -484,6 +717,148 @@ class TemplateEditorDialog(QDialog):
             spacing_cm=self.spacing_spin.value()
         )
 
+# ==================== Sistema de Guías Inteligentes ====================
+
+class TransformTooltip(QGraphicsTextItem):
+    """Tooltip para mostrar información durante transformación (estilo Canva)"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDefaultTextColor(QColor(255, 255, 255))
+        self.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        self.setZValue(10000)
+        
+        # Fondo del tooltip
+        self.background = QGraphicsRectItem(parent)
+        self.background.setBrush(QBrush(QColor(45, 45, 45, 230)))
+        self.background.setPen(QPen(QColor(0, 196, 204), 1))
+        self.background.setZValue(9999)
+        self.hide()
+    
+    def show_at(self, x, y, text):
+        """Muestra tooltip en posición específica"""
+        self.setPlainText(text)
+        self.setPos(x - self.boundingRect().width() / 2, y - 35)
+        
+        # Actualizar fondo
+        rect = self.boundingRect()
+        padding = 6
+        self.background.setRect(
+            x - rect.width() / 2 - padding,
+            y - 35 - padding,
+            rect.width() + padding * 2,
+            rect.height() + padding * 2
+        )
+        
+        self.setVisible(True)
+        self.background.setVisible(True)
+    
+    def hide(self):
+        """Oculta tooltip"""
+        self.setVisible(False)
+        self.background.setVisible(False)
+
+class SmartGuides:
+    """Sistema de guías de alineación inteligentes (estilo Canva)"""
+    
+    def __init__(self, canvas_editor, snap_threshold=5):
+        self.canvas_editor = canvas_editor
+        self.snap_threshold = snap_threshold
+        self.active_guides = []  # Lista de líneas de guía activas
+    
+    def find_snap_positions(self, moving_item):
+        """Encuentra posiciones de snap para alineación"""
+        self.clear_guides()
+        
+        if not moving_item or not hasattr(moving_item, 'canvas_item'):
+            return None, None
+        
+        moving_rect = moving_item.sceneBoundingRect()
+        moving_center_x = moving_rect.center().x()
+        moving_center_y = moving_rect.center().y()
+        
+        snap_x = None
+        snap_y = None
+        
+        # Comparar con otros objetos
+        for item in self.canvas_editor.scene.items():
+            if not isinstance(item, DraggableImageItem) or item == moving_item:
+                continue
+            
+            other_rect = item.sceneBoundingRect()
+            other_center_x = other_rect.center().x()
+            other_center_y = other_rect.center().y()
+            
+            # Alineación vertical (centros)
+            if abs(moving_center_x - other_center_x) < self.snap_threshold:
+                snap_x = other_center_x
+                self.add_vertical_guide(other_center_x)
+            
+            # Alineación horizontal (centros)
+            if abs(moving_center_y - other_center_y) < self.snap_threshold:
+                snap_y = other_center_y
+                self.add_horizontal_guide(other_center_y)
+            
+            # Alineación de bordes
+            if abs(moving_rect.left() - other_rect.left()) < self.snap_threshold:
+                snap_x = other_rect.left() + moving_rect.width() / 2
+                self.add_vertical_guide(other_rect.left())
+            
+            if abs(moving_rect.right() - other_rect.right()) < self.snap_threshold:
+                snap_x = other_rect.right() - moving_rect.width() / 2
+                self.add_vertical_guide(other_rect.right())
+            
+            if abs(moving_rect.top() - other_rect.top()) < self.snap_threshold:
+                snap_y = other_rect.top() + moving_rect.height() / 2
+                self.add_horizontal_guide(other_rect.top())
+            
+            if abs(moving_rect.bottom() - other_rect.bottom()) < self.snap_threshold:
+                snap_y = other_rect.bottom() - moving_rect.height() / 2
+                self.add_horizontal_guide(other_rect.bottom())
+        
+        # Alineación con canvas
+        scene_rect = self.canvas_editor.scene.sceneRect()
+        canvas_center_x = scene_rect.center().x()
+        canvas_center_y = scene_rect.center().y()
+        
+        if abs(moving_center_x - canvas_center_x) < self.snap_threshold:
+            snap_x = canvas_center_x
+            self.add_vertical_guide(canvas_center_x)
+        
+        if abs(moving_center_y - canvas_center_y) < self.snap_threshold:
+            snap_y = canvas_center_y
+            self.add_horizontal_guide(canvas_center_y)
+        
+        return snap_x, snap_y
+    
+    def add_vertical_guide(self, x):
+        """Añade guía vertical"""
+        scene_rect = self.canvas_editor.scene.sceneRect()
+        line = self.canvas_editor.scene.addLine(
+            x, scene_rect.top(),
+            x, scene_rect.bottom(),
+            QPen(QColor(0, 196, 204), 1, Qt.PenStyle.DashLine)
+        )
+        line.setZValue(9999)
+        self.active_guides.append(line)
+    
+    def add_horizontal_guide(self, y):
+        """Añade guía horizontal"""
+        scene_rect = self.canvas_editor.scene.sceneRect()
+        line = self.canvas_editor.scene.addLine(
+            scene_rect.left(), y,
+            scene_rect.right(), y,
+            QPen(QColor(0, 196, 204), 1, Qt.PenStyle.DashLine)
+        )
+        line.setZValue(9999)
+        self.active_guides.append(line)
+    
+    def clear_guides(self):
+        """Limpia todas las guías activas"""
+        for guide in self.active_guides:
+            self.canvas_editor.scene.removeItem(guide)
+        self.active_guides.clear()
+
 # ==================== Lista de Capas con Drag & Drop ====================
 
 class LayersListWidget(QListWidget):
@@ -519,10 +894,14 @@ class CanvasEditor(QMainWindow):
         self.show_grid = True
         self.show_rulers = True
         self.snap_to_grid = False
+        self.show_smart_guides = True  # Guías inteligentes activadas por defecto
         
         # Imágenes en el canvas
         self.canvas_images: List[CanvasImageItem] = []
         self.loaded_images: List[str] = []
+        
+        # Sistema de guías inteligentes
+        self.smart_guides = None  # Se inicializa después de crear scene
         
         # Zoom
         self.zoom_factor = 1.0
@@ -574,16 +953,50 @@ class CanvasEditor(QMainWindow):
         QShortcut(QKeySequence.StandardKey.ZoomOut, self, lambda: self.change_zoom(-0.2))
     
     def setup_ui(self):
-        # Widget central
+        """Setup main UI layout"""
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout()
         
-        # === PANEL IZQUIERDO ===
+        # Create three main panels
+        left_widget = self._create_left_panel()
+        center_widget = self._create_center_panel()
+        right_widget = self._create_right_panel()
+        
+        # Assemble main layout
+        main_layout.addWidget(left_widget)
+        main_layout.addWidget(center_widget, 1)
+        main_layout.addWidget(right_widget)
+        
+        central.setLayout(main_layout)
+        self.statusBar().showMessage("Canvas listo ✓")
+    
+    def _create_left_panel(self):
+        """Create left panel with canvas configuration and templates"""
+        left_widget = QWidget()
+        left_widget.setMaximumWidth(320)
         left_panel = QVBoxLayout()
         left_panel.setSpacing(10)
         
-        # Configuración del canvas
+        # Add components
+        config_group = self._create_canvas_config_group()
+        apply_canvas_btn = self._create_apply_canvas_button()
+        images_group = self._create_images_group()
+        templates_group = self._create_templates_group()
+        view_group = self._create_view_options_group()
+        
+        left_panel.addWidget(config_group)
+        left_panel.addWidget(apply_canvas_btn)
+        left_panel.addWidget(images_group)
+        left_panel.addWidget(templates_group)
+        left_panel.addWidget(view_group)
+        left_panel.addStretch()
+        
+        left_widget.setLayout(left_panel)
+        return left_widget
+    
+    def _create_canvas_config_group(self):
+        """Create canvas configuration group"""
         config_group = QGroupBox("📄 Configuración del Canvas")
         config_layout = QFormLayout()
         
@@ -626,13 +1039,22 @@ class CanvasEditor(QMainWindow):
         config_layout.addRow("Alto:", self.custom_height)
         config_layout.addRow("Calidad:", self.dpi_combo)
         
+        config_group.setLayout(config_layout)
+        return config_group
+    
+    def _create_apply_canvas_button(self):
+        """Create apply canvas configuration button"""
         apply_canvas_btn = QPushButton("🔄 Aplicar Configuración")
         apply_canvas_btn.clicked.connect(self.recreate_canvas)
         apply_canvas_btn.setStyleSheet("background: #0078d7; color: white; font-weight: bold; padding: 8px;")
-        
-        config_group.setLayout(config_layout)
-        
-        # Imágenes cargadas
+        return apply_canvas_btn
+    
+    def _create_images_group(self):
+        """Create images group for loading images"""
+        images_group = QGroupBox("🖼️ Imágenes Disponibles")
+        images_layout = QVBoxLayout()
+    def _create_images_group(self):
+        """Create images group for loading images"""
         images_group = QGroupBox("🖼️ Imágenes Disponibles")
         images_layout = QVBoxLayout()
         
@@ -647,12 +1069,14 @@ class CanvasEditor(QMainWindow):
         images_layout.addWidget(self.images_list)
         images_layout.addWidget(load_btn)
         images_group.setLayout(images_layout)
-        
-        # Plantillas
+        return images_group
+    
+    def _create_templates_group(self):
+        """Create templates group for quick layouts"""
         templates_group = QGroupBox("📋 Plantillas Rápidas")
         templates_layout = QVBoxLayout()
         
-        # Scroll area para plantillas
+        # Scroll area for templates
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setMaximumHeight(200)
@@ -660,7 +1084,7 @@ class CanvasEditor(QMainWindow):
         templates_widget = QWidget()
         templates_inner = QVBoxLayout()
         
-        # Plantillas predefinidas
+        # Predefined templates
         btn_4x4 = QPushButton("📸 4x4 DNI (4 fotos)")
         btn_4x4.clicked.connect(lambda: self.apply_predefined_template("4x4"))
         
@@ -674,7 +1098,7 @@ class CanvasEditor(QMainWindow):
         templates_inner.addWidget(btn_2x3)
         templates_inner.addWidget(btn_collage)
         
-        # Plantillas personalizadas
+        # Custom templates
         for template in self.custom_templates:
             btn = QPushButton(f"⭐ {template.name}")
             btn.clicked.connect(lambda checked, t=template: self.apply_custom_template(t))
@@ -684,7 +1108,7 @@ class CanvasEditor(QMainWindow):
         templates_widget.setLayout(templates_inner)
         scroll.setWidget(templates_widget)
         
-        # Botones de gestión de plantillas
+        # Template management buttons
         template_btns = QHBoxLayout()
         edit_template_btn = QPushButton("✏️ Editar")
         edit_template_btn.clicked.connect(self.edit_template)
@@ -696,8 +1120,10 @@ class CanvasEditor(QMainWindow):
         templates_layout.addWidget(scroll)
         templates_layout.addLayout(template_btns)
         templates_group.setLayout(templates_layout)
-        
-        # Opciones de vista
+        return templates_group
+    
+    def _create_view_options_group(self):
+        """Create view options group"""
         view_group = QGroupBox("👁️ Vista")
         view_layout = QVBoxLayout()
         
@@ -710,24 +1136,48 @@ class CanvasEditor(QMainWindow):
         self.snap_check.stateChanged.connect(self.toggle_snap)
         self.apply_checkbox_style(self.snap_check)
         
+        self.guides_check = QCheckBox("Guías inteligentes")
+        self.guides_check.setChecked(True)
+        self.guides_check.stateChanged.connect(self.toggle_smart_guides)
+        self.apply_checkbox_style(self.guides_check)
+        
         view_layout.addWidget(self.grid_check)
         view_layout.addWidget(self.snap_check)
+        view_layout.addWidget(self.guides_check)
         view_group.setLayout(view_layout)
-        
-        # Ensamblar panel izquierdo
-        left_panel.addWidget(config_group)
-        left_panel.addWidget(apply_canvas_btn)
-        left_panel.addWidget(images_group)
-        left_panel.addWidget(templates_group)
-        left_panel.addWidget(view_group)
-        left_panel.addStretch()
-        
-        # === PANEL CENTRAL - CANVAS ===
+        return view_group
+    
+    def _create_center_panel(self):
+        """Create center panel with canvas view"""
+        center_widget = QWidget()
         center_layout = QVBoxLayout()
         
-        # Toolbar superior
+        # Toolbar
+        toolbar = self._create_toolbar()
+        
+        # Graphics View for canvas
+        self.scene = QGraphicsScene()
+        self.view = QGraphicsView(self.scene)
+        self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        self.view.setStyleSheet("background: #cccccc;")
+        self.view.setAcceptDrops(True)
+        self.view.viewport().installEventFilter(self)
+        
+        # Inicializar sistema de guías inteligentes
+        self.smart_guides = SmartGuides(self)
+        
+        center_layout.addLayout(toolbar)
+        center_layout.addWidget(self.view)
+        center_widget.setLayout(center_layout)
+        return center_widget
+    
+    def _create_toolbar(self):
+        """Create toolbar with zoom and undo/redo controls"""
         toolbar = QHBoxLayout()
         
+        # Zoom controls
         zoom_out_btn = QPushButton("🔍-")
         zoom_out_btn.clicked.connect(lambda: self.change_zoom(-0.2))
         
@@ -757,25 +1207,32 @@ class CanvasEditor(QMainWindow):
         toolbar.addWidget(undo_btn)
         toolbar.addWidget(redo_btn)
         
-        # Graphics View para el canvas
-        self.scene = QGraphicsScene()
-        self.view = QGraphicsView(self.scene)
-        self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
-        self.view.setStyleSheet("background: #cccccc;")
-        self.view.setAcceptDrops(True)
-        
-        # Instalar event filter para drag & drop
-        self.view.viewport().installEventFilter(self)
-        
-        center_layout.addLayout(toolbar)
-        center_layout.addWidget(self.view)
-        
-        # === PANEL DERECHO - PROPIEDADES ===
+        return toolbar
+    
+    def _create_right_panel(self):
+        """Create right panel with properties and actions"""
+        right_widget = QWidget()
+        right_widget.setMaximumWidth(300)
         right_panel = QVBoxLayout()
         right_panel.setSpacing(10)
         
+        # Add components
+        props_group = self._create_properties_group()
+        actions_group = self._create_actions_group()
+        layers_group = self._create_layers_group()
+        export_group = self._create_export_group()
+        
+        right_panel.addWidget(props_group)
+        right_panel.addWidget(actions_group)
+        right_panel.addWidget(layers_group)
+        right_panel.addWidget(export_group)
+        right_panel.addStretch()
+        
+        right_widget.setLayout(right_panel)
+        return right_widget
+    
+    def _create_properties_group(self):
+        """Create properties group for selected images"""
         props_group = QGroupBox("⚙️ Propiedades de Imagen")
         props_layout = QFormLayout()
         
@@ -829,8 +1286,10 @@ class CanvasEditor(QMainWindow):
         props_layout.addRow("", self.lock_aspect)
         
         props_group.setLayout(props_layout)
-        
-        # Acciones sobre imagen seleccionada
+        return props_group
+    
+    def _create_actions_group(self):
+        """Create actions group for image manipulation"""
         actions_group = QGroupBox("🔧 Acciones")
         actions_layout = QVBoxLayout()
         
@@ -855,8 +1314,10 @@ class CanvasEditor(QMainWindow):
         actions_layout.addWidget(btn_to_back)
         actions_layout.addWidget(btn_lock)
         actions_group.setLayout(actions_layout)
-        
-        # Capas
+        return actions_group
+    
+    def _create_layers_group(self):
+        """Create layers group for layer management"""
         layers_group = QGroupBox("📚 Capas")
         layers_layout = QVBoxLayout()
         
@@ -868,8 +1329,10 @@ class CanvasEditor(QMainWindow):
         layers_layout.addWidget(QLabel("<i>Arrastra para reordenar</i>"))
         layers_layout.addWidget(self.layers_list)
         layers_group.setLayout(layers_layout)
-        
-        # Exportar
+        return layers_group
+    
+    def _create_export_group(self):
+        """Create export group for canvas export"""
         export_group = QGroupBox("💾 Exportar")
         export_layout = QVBoxLayout()
         
@@ -884,34 +1347,7 @@ class CanvasEditor(QMainWindow):
         export_layout.addWidget(self.export_format)
         export_layout.addWidget(btn_export)
         export_group.setLayout(export_layout)
-        
-        # Ensamblar panel derecho
-        right_panel.addWidget(props_group)
-        right_panel.addWidget(actions_group)
-        right_panel.addWidget(layers_group)
-        right_panel.addWidget(export_group)
-        right_panel.addStretch()
-        
-        # === ENSAMBLAR TODO ===
-        left_widget = QWidget()
-        left_widget.setLayout(left_panel)
-        left_widget.setMaximumWidth(320)
-        
-        center_widget = QWidget()
-        center_widget.setLayout(center_layout)
-        
-        right_widget = QWidget()
-        right_widget.setLayout(right_panel)
-        right_widget.setMaximumWidth(300)
-        
-        main_layout.addWidget(left_widget)
-        main_layout.addWidget(center_widget, 1)
-        main_layout.addWidget(right_widget)
-        
-        central.setLayout(main_layout)
-        
-        # Barra de estado
-        self.statusBar().showMessage("Canvas listo ✓")
+        return export_group
     
     def apply_checkbox_style(self, checkbox):
         """Aplicar estilo mejorado a checkbox"""
@@ -2185,6 +2621,12 @@ class CanvasEditor(QMainWindow):
     def toggle_snap(self, state):
         """Activar/desactivar ajuste a cuadrícula"""
         self.snap_to_grid = state == Qt.CheckState.Checked.value
+    
+    def toggle_smart_guides(self, state):
+        """Activar/desactivar guías inteligentes"""
+        self.show_smart_guides = state == Qt.CheckState.Checked.value
+        if not self.show_smart_guides and self.smart_guides:
+            self.smart_guides.clear_guides()
     
     def change_zoom(self, delta):
         """Cambiar zoom"""
