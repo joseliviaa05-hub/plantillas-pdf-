@@ -30,6 +30,68 @@ def pixels_to_cm(pixels: float, dpi: int = 96) -> float:
     inches = pixels / dpi
     return inches * 2.54
 
+# ==================== Gestor de Archivos Temporales ====================
+
+class TempFileManager:
+    """
+    Gestor centralizado de archivos temporales con Singleton pattern
+    
+    Características:
+    - Registro de todos los archivos temporales creados
+    - Limpieza automática al destruir
+    - Limpieza de archivos antiguos
+    - Context manager support
+    """
+    _instance = None
+    
+    @classmethod
+    def get_instance(cls):
+        """Obtener instancia única (Singleton)"""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+    
+    def __init__(self):
+        """Inicializar gestor de archivos temporales"""
+        if TempFileManager._instance is not None:
+            raise RuntimeError("Use TempFileManager.get_instance() en lugar del constructor")
+        self.temp_files: Set[str] = set()
+    
+    def register_temp_file(self, path: str):
+        """Registrar archivo temporal para limpieza posterior"""
+        if os.path.exists(path):
+            self.temp_files.add(path)
+    
+    def cleanup(self):
+        """Eliminar todos los archivos temporales registrados"""
+        for file_path in list(self.temp_files):
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                self.temp_files.discard(file_path)
+            except Exception as e:
+                print(f"Error eliminando archivo temporal {file_path}: {e}")
+    
+    def cleanup_old_files(self, max_age_hours: int = 24):
+        """Eliminar archivos temporales más antiguos que max_age_hours"""
+        import time
+        current_time = time.time()
+        max_age_seconds = max_age_hours * 3600
+        
+        for file_path in list(self.temp_files):
+            try:
+                if os.path.exists(file_path):
+                    file_age = current_time - os.path.getmtime(file_path)
+                    if file_age > max_age_seconds:
+                        os.remove(file_path)
+                        self.temp_files.discard(file_path)
+            except Exception as e:
+                print(f"Error limpiando archivo antiguo {file_path}: {e}")
+    
+    def __del__(self):
+        """Limpieza automática al destruir el gestor"""
+        self.cleanup()
+
 # ==================== Clases de Datos ====================
 
 @dataclass
@@ -59,6 +121,59 @@ class TemplatePreset:
     margin_cm: float
     spacing_cm: float = 0.5
 
+@dataclass
+class TextCanvasItem:
+    """Objeto de texto en el canvas con todas sus propiedades"""
+    text: str
+    x: float
+    y: float
+    width: float  # Ancho de la caja de texto en cm
+    height: float  # Alto en cm (auto-ajustable)
+    
+    # Tipografía
+    font_family: str = "Arial"
+    font_size: float = 16.0  # En puntos
+    font_weight: str = "normal"  # normal, bold, light, black
+    font_style: str = "normal"  # normal, italic, oblique
+    
+    # Color y apariencia
+    color: str = "#000000"
+    background_color: str = "transparent"
+    background_opacity: float = 0.0
+    
+    # Alineación y espaciado
+    alignment: str = "left"  # left, center, right, justify
+    line_height: float = 1.2  # Múltiplo del tamaño de fuente
+    letter_spacing: float = 0.0  # En puntos
+    
+    # Decoración
+    underline: bool = False
+    strikethrough: bool = False
+    text_transform: str = "none"  # none, uppercase, lowercase, capitalize
+    
+    # Efectos
+    shadow_enabled: bool = False
+    shadow_offset_x: float = 2.0
+    shadow_offset_y: float = 2.0
+    shadow_blur: float = 4.0
+    shadow_color: str = "#00000080"
+    
+    outline_enabled: bool = False
+    outline_width: float = 1.0
+    outline_color: str = "#000000"
+    
+    # Transformación
+    rotation: float = 0
+    opacity: float = 1.0
+    z_index: int = 0
+    
+    # Estado
+    locked: bool = False
+    visible: bool = True
+    editable: bool = True  # Si está en modo edición
+    
+    uuid: str = field(default_factory=lambda: str(uuid.uuid4()))
+
 # ==================== Item Gráfico Arrastrable ====================
 
 class DraggableImageItem(QGraphicsPixmapItem):
@@ -71,18 +186,24 @@ class DraggableImageItem(QGraphicsPixmapItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not canvas_item.locked)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.setAcceptHoverEvents(True)  # Habilitar eventos hover para cambiar cursor
         self.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self.setOpacity(canvas_item.opacity)
         self.setZValue(canvas_item.z_index)
         
-        # Handles de redimensionamiento
-        self.resize_handle_size = 10
+        # Sistema profesional de handles estilo Canva
+        self.handle_size = 12  # Tamaño de handles (círculos)
+        self.rotation_handle_distance = 30  # Distancia del handle de rotación
         self.is_resizing = False
-        self.resize_corner = None
-        self.resize_side = None
+        self.is_rotating = False
+        self.resize_handle = None  # 'tl', 'tr', 'bl', 'br', 't', 'b', 'l', 'r'
         self.resize_start_pos = None
         self.resize_start_rect = None
         self.resize_start_pixmap = None
+        self.resize_from_center = False  # Alt presionado
+        self.maintain_aspect_ratio = False  # Shift presionado
+        self.rotation_start_angle = 0
+        self.rotation_start_pos = None
         
         # Rotación
         self.setTransformOriginPoint(self.boundingRect().center())
@@ -90,10 +211,18 @@ class DraggableImageItem(QGraphicsPixmapItem):
         
     def boundingRect(self):
         rect = super().boundingRect()
-        margin = self.resize_handle_size + 2
-        return rect.adjusted(-margin, -margin, margin, margin)
+        # Expandir para incluir handles y handle de rotación
+        margin = self.handle_size + 2
+        rotation_margin = self.rotation_handle_distance + self.handle_size + 5
+        return rect.adjusted(-margin, -(rotation_margin + margin), margin, margin)
     
     def paint(self, painter, option, widget):
+        """Dibujar imagen con controles personalizados profesionales (sin borde automático de Qt)"""
+        
+        # ===== SOLUCIÓN: Deshabilitar el borde de selección automático de Qt =====
+        # Esta línea elimina el marco exterior que Qt dibuja automáticamente
+        option.state &= ~QStyle.StateFlag.State_Selected
+        
         # Dibujar la imagen
         super().paint(painter, option, widget)
         
@@ -101,135 +230,231 @@ class DraggableImageItem(QGraphicsPixmapItem):
         if self.isSelected():
             rect = self.pixmap().rect()
             
-            # Borde de selección animado
-            pen = QPen(QColor(0, 120, 215), 2, Qt.PenStyle.DashLine)
+            # Guardar estado del painter
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            
+            # Color turquesa profesional estilo Canva
+            canva_color = QColor(0, 196, 204)  # #00c4cc
+            
+            # Borde de selección (línea sólida turquesa)
+            pen = QPen(canva_color, 2, Qt.PenStyle.SolidLine)
             painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(rect)
             
-            # Handles en las esquinas (para redimensionar proporcional)
-            handle_size = self.resize_handle_size
-            painter.setBrush(QBrush(QColor(0, 120, 215)))
-            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            # Estilo de handles profesionales
+            handle_size = self.handle_size
             
+            # Configuración visual de handles
+            painter.setBrush(QBrush(QColor(255, 255, 255)))  # Relleno blanco
+            painter.setPen(QPen(canva_color, 2))  # Borde turquesa
+            
+            # Handles en las esquinas (círculos para redimensionar)
             corners = [
-                QRectF(rect.left() - handle_size/2, rect.top() - handle_size/2, handle_size, handle_size),  # TL
-                QRectF(rect.right() - handle_size/2, rect.top() - handle_size/2, handle_size, handle_size),  # TR
-                QRectF(rect.left() - handle_size/2, rect.bottom() - handle_size/2, handle_size, handle_size),  # BL
-                QRectF(rect.right() - handle_size/2, rect.bottom() - handle_size/2, handle_size, handle_size),  # BR
+                QPointF(rect.left(), rect.top()),      # TL
+                QPointF(rect.right(), rect.top()),     # TR
+                QPointF(rect.left(), rect.bottom()),   # BL
+                QPointF(rect.right(), rect.bottom()),  # BR
             ]
             
             for corner in corners:
-                painter.drawEllipse(corner)
+                painter.drawEllipse(corner, handle_size/2, handle_size/2)
             
-            # Handles en los lados (para deformar)
+            # Handles en los lados (círculos para redimensionar en una dirección)
             sides = [
-                QRectF((rect.left() + rect.right())/2 - handle_size/2, rect.top() - handle_size/2, handle_size, handle_size),  # T
-                QRectF((rect.left() + rect.right())/2 - handle_size/2, rect.bottom() - handle_size/2, handle_size, handle_size),  # B
-                QRectF(rect.left() - handle_size/2, (rect.top() + rect.bottom())/2 - handle_size/2, handle_size, handle_size),  # L
-                QRectF(rect.right() - handle_size/2, (rect.top() + rect.bottom())/2 - handle_size/2, handle_size, handle_size),  # R
+                QPointF((rect.left() + rect.right())/2, rect.top()),      # T
+                QPointF((rect.left() + rect.right())/2, rect.bottom()),   # B
+                QPointF(rect.left(), (rect.top() + rect.bottom())/2),     # L
+                QPointF(rect.right(), (rect.top() + rect.bottom())/2),    # R
             ]
             
-            painter.setBrush(QBrush(QColor(255, 165, 0)))
             for side in sides:
-                painter.drawRect(side)
+                painter.drawEllipse(side, handle_size/2, handle_size/2)
+            
+            # Handle de rotación (arriba, centro, con línea de conexión)
+            rotation_handle_y = rect.top() - self.rotation_handle_distance
+            rotation_handle_center = QPointF((rect.left() + rect.right())/2, rotation_handle_y)
+            
+            # Línea de conexión punteada
+            painter.setPen(QPen(canva_color, 1, Qt.PenStyle.DashLine))
+            painter.drawLine(
+                QPointF((rect.left() + rect.right())/2, rect.top()),
+                rotation_handle_center
+            )
+            
+            # Handle de rotación (círculo con ícono)
+            painter.setPen(QPen(canva_color, 2))
+            painter.setBrush(QBrush(QColor(255, 255, 255)))
+            painter.drawEllipse(rotation_handle_center, handle_size/2, handle_size/2)
+            
+            # Dibujar ícono de rotación en el handle
+            painter.setPen(QPen(canva_color, 1.5))
+            arc_rect = QRectF(
+                rotation_handle_center.x() - 4,
+                rotation_handle_center.y() - 4,
+                8, 8
+            )
+            painter.drawArc(arc_rect, 45 * 16, 270 * 16)  # Arco circular
+            
+            painter.restore()
     
     def get_handle_at_pos(self, pos):
-        """Determinar qué handle se clickeó"""
+        """Determinar qué handle se clickeó (profesional estilo Canva)"""
         rect = self.pixmap().rect()
-        handle_size = self.resize_handle_size
+        handle_size = self.handle_size
+        threshold = handle_size  # Área de detección del handle
         
-        # Esquinas (redimensionar proporcional)
+        # Handle de rotación (prioridad máxima)
+        rotation_handle_y = rect.top() - self.rotation_handle_distance
+        rotation_center = QPointF((rect.left() + rect.right())/2, rotation_handle_y)
+        if (pos - rotation_center).manhattanLength() < threshold:
+            return 'rotation'
+        
+        # Handles de esquinas (para redimensionar)
         corners = {
-            'tl': QRectF(rect.left() - handle_size/2, rect.top() - handle_size/2, handle_size, handle_size),
-            'tr': QRectF(rect.right() - handle_size/2, rect.top() - handle_size/2, handle_size, handle_size),
-            'bl': QRectF(rect.left() - handle_size/2, rect.bottom() - handle_size/2, handle_size, handle_size),
-            'br': QRectF(rect.right() - handle_size/2, rect.bottom() - handle_size/2, handle_size, handle_size),
+            'tl': QPointF(rect.left(), rect.top()),
+            'tr': QPointF(rect.right(), rect.top()),
+            'bl': QPointF(rect.left(), rect.bottom()),
+            'br': QPointF(rect.right(), rect.bottom()),
         }
         
-        for corner, handle_rect in corners.items():
-            if handle_rect.contains(pos):
-                return ('corner', corner)
+        for corner_name, corner_pos in corners.items():
+            if (pos - corner_pos).manhattanLength() < threshold:
+                return corner_name
         
-        # Lados (deformar)
+        # Handles de lados (para redimensionar en una dirección)
         sides = {
-            't': QRectF((rect.left() + rect.right())/2 - handle_size/2, rect.top() - handle_size/2, handle_size, handle_size),
-            'b': QRectF((rect.left() + rect.right())/2 - handle_size/2, rect.bottom() - handle_size/2, handle_size, handle_size),
-            'l': QRectF(rect.left() - handle_size/2, (rect.top() + rect.bottom())/2 - handle_size/2, handle_size, handle_size),
-            'r': QRectF(rect.right() - handle_size/2, (rect.top() + rect.bottom())/2 - handle_size/2, handle_size, handle_size),
+            't': QPointF((rect.left() + rect.right())/2, rect.top()),
+            'b': QPointF((rect.left() + rect.right())/2, rect.bottom()),
+            'l': QPointF(rect.left(), (rect.top() + rect.bottom())/2),
+            'r': QPointF(rect.right(), (rect.top() + rect.bottom())/2),
         }
         
-        for side, handle_rect in sides.items():
-            if handle_rect.contains(pos):
-                return ('side', side)
+        for side_name, side_pos in sides.items():
+            if (pos - side_pos).manhattanLength() < threshold:
+                return side_name
         
-        return (None, None)
+        return None
     
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and not self.canvas_item.locked:
             pos = event.pos()
-            handle_type, handle_pos = self.get_handle_at_pos(pos)
+            handle = self.get_handle_at_pos(pos)
             
-            if handle_type:
+            if handle == 'rotation':
+                # Iniciar rotación
+                self.is_rotating = True
+                self.rotation_start_pos = event.scenePos()
+                center = self.sceneBoundingRect().center()
+                # Calcular ángulo inicial
+                delta = self.rotation_start_pos - center
+                import math
+                self.rotation_start_angle = math.atan2(delta.y(), delta.x()) - math.radians(self.rotation())
+                event.accept()
+                return
+            elif handle:
+                # Iniciar redimensionamiento
                 self.is_resizing = True
-                self.resize_corner = handle_pos if handle_type == 'corner' else None
-                self.resize_side = handle_pos if handle_type == 'side' else None
+                self.resize_handle = handle
                 self.resize_start_pos = event.scenePos()
-                self.resize_start_rect = self.boundingRect()
+                self.resize_start_rect = self.pixmap().rect()
                 self.resize_start_pixmap = self.pixmap()
+                self.resize_from_center = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+                self.maintain_aspect_ratio = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
                 event.accept()
                 return
         
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event):
-        if self.is_resizing:
+        import math
+        
+        if self.is_rotating:
+            # Rotación del objeto
+            center = self.sceneBoundingRect().center()
+            current_pos = event.scenePos()
+            delta = current_pos - center
+            current_angle = math.atan2(delta.y(), delta.x())
+            angle_degrees = math.degrees(current_angle - self.rotation_start_angle)
+            
+            # Snap a 15° con Shift presionado
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                angle_degrees = round(angle_degrees / 15) * 15
+            
+            # Snap a 0°, 90°, 180°, 270° cuando está cerca (±5°)
+            snap_angles = [0, 90, 180, 270, 360]
+            for snap_angle in snap_angles:
+                if abs(angle_degrees - snap_angle) < 5:
+                    angle_degrees = snap_angle
+                    break
+                if abs(angle_degrees + 360 - snap_angle) < 5:
+                    angle_degrees = snap_angle
+                    break
+            
+            self.setRotation(angle_degrees)
+            
+            # TODO: Mostrar tooltip con ángulo actual
+            event.accept()
+            
+        elif self.is_resizing:
+            # Redimensionamiento del objeto
             delta = event.scenePos() - self.resize_start_pos
             current_pixmap = self.resize_start_pixmap
+            rect = self.resize_start_rect
             
-            if self.resize_corner:
-                # Redimensionar desde esquina (proporcional o no)
-                new_width = max(20, current_pixmap.width())
-                new_height = max(20, current_pixmap.height())
+            # Actualizar flags según teclas modificadoras
+            self.resize_from_center = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+            self.maintain_aspect_ratio = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            
+            # Calcular nuevo tamaño según el handle
+            new_width = rect.width()
+            new_height = rect.height()
+            
+            if self.resize_handle in ['tl', 'tr', 'bl', 'br']:
+                # Handles de esquina
+                if self.resize_handle == 'br':
+                    new_width = max(10, rect.width() + delta.x())
+                    new_height = max(10, rect.height() + delta.y())
+                elif self.resize_handle == 'bl':
+                    new_width = max(10, rect.width() - delta.x())
+                    new_height = max(10, rect.height() + delta.y())
+                elif self.resize_handle == 'tr':
+                    new_width = max(10, rect.width() + delta.x())
+                    new_height = max(10, rect.height() - delta.y())
+                elif self.resize_handle == 'tl':
+                    new_width = max(10, rect.width() - delta.x())
+                    new_height = max(10, rect.height() - delta.y())
                 
-                if self.resize_corner == 'br':
-                    new_width = max(20, current_pixmap.width() + delta.x())
-                    new_height = max(20, current_pixmap.height() + delta.y())
-                elif self.resize_corner == 'bl':
-                    new_width = max(20, current_pixmap.width() - delta.x())
-                    new_height = max(20, current_pixmap.height() + delta.y())
-                elif self.resize_corner == 'tr':
-                    new_width = max(20, current_pixmap.width() + delta.x())
-                    new_height = max(20, current_pixmap.height() - delta.y())
-                elif self.resize_corner == 'tl':
-                    new_width = max(20, current_pixmap.width() - delta.x())
-                    new_height = max(20, current_pixmap.height() - delta.y())
-                
-                # Mantener proporción con Shift
-                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                    aspect_ratio = current_pixmap.width() / current_pixmap.height()
+                # Mantener proporción si Shift está presionado
+                if self.maintain_aspect_ratio:
+                    aspect_ratio = rect.width() / rect.height()
                     new_height = new_width / aspect_ratio
-                
+                    
+            elif self.resize_handle in ['t', 'b', 'l', 'r']:
+                # Handles de lados
+                if self.resize_handle == 'r':
+                    new_width = max(10, rect.width() + delta.x())
+                elif self.resize_handle == 'l':
+                    new_width = max(10, rect.width() - delta.x())
+                elif self.resize_handle == 'b':
+                    new_height = max(10, rect.height() + delta.y())
+                elif self.resize_handle == 't':
+                    new_height = max(10, rect.height() - delta.y())
+            
+            # Redimensionar desde el centro si Alt está presionado
+            if self.resize_from_center:
+                # Calcular el offset para redimensionar desde el centro
+                old_center = self.pos() + QPointF(rect.width()/2, rect.height()/2)
                 scaled_pixmap = current_pixmap.scaled(
                     int(new_width), int(new_height),
                     Qt.AspectRatioMode.IgnoreAspectRatio,
                     Qt.TransformationMode.SmoothTransformation
                 )
                 self.setPixmap(scaled_pixmap)
-                
-            elif self.resize_side:
-                # Deformar desde lado
-                new_width = current_pixmap.width()
-                new_height = current_pixmap.height()
-                
-                if self.resize_side == 'r':
-                    new_width = max(20, current_pixmap.width() + delta.x())
-                elif self.resize_side == 'l':
-                    new_width = max(20, current_pixmap.width() - delta.x())
-                elif self.resize_side == 'b':
-                    new_height = max(20, current_pixmap.height() + delta.y())
-                elif self.resize_side == 't':
-                    new_height = max(20, current_pixmap.height() - delta.y())
-                
+                new_center_offset = QPointF(new_width/2, new_height/2)
+                self.setPos(old_center - new_center_offset)
+            else:
                 scaled_pixmap = current_pixmap.scaled(
                     int(new_width), int(new_height),
                     Qt.AspectRatioMode.IgnoreAspectRatio,
@@ -237,24 +462,89 @@ class DraggableImageItem(QGraphicsPixmapItem):
                 )
                 self.setPixmap(scaled_pixmap)
             
+            # TODO: Mostrar tooltip con dimensiones actuales
             event.accept()
         else:
             super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event):
-        if self.is_resizing:
+        # Limpiar guías smart cuando se suelta el objeto
+        if hasattr(self.canvas_editor, 'smart_guides'):
+            self.canvas_editor.smart_guides.clear_guides()
+        
+        if self.is_rotating:
+            # Finalizar rotación
+            self.is_rotating = False
+            self.canvas_item.rotation = self.rotation()
+            self.canvas_editor.update_properties_from_selection()
+            self.canvas_editor.save_history_state()
+            event.accept()
+        elif self.is_resizing:
+            # Finalizar redimensionamiento
             self.is_resizing = False
             # Actualizar canvas_item con nuevo tamaño
             dpi = self.canvas_editor.canvas_dpi
             self.canvas_item.width = pixels_to_cm(self.pixmap().width(), dpi)
             self.canvas_item.height = pixels_to_cm(self.pixmap().height(), dpi)
+            # Actualizar posición si se redimensionó desde el centro
+            pos = self.pos()
+            self.canvas_item.x = pixels_to_cm(pos.x(), dpi)
+            self.canvas_item.y = pixels_to_cm(pos.y(), dpi)
             self.canvas_editor.update_properties_from_selection()
             self.canvas_editor.save_history_state()
             event.accept()
         else:
             super().mouseReleaseEvent(event)
     
+    def hoverMoveEvent(self, event):
+        """Cambiar cursor según el handle sobre el que se encuentre"""
+        if self.canvas_item.locked:
+            return super().hoverMoveEvent(event)
+        
+        handle = self.get_handle_at_pos(event.pos())
+        
+        if handle == 'rotation':
+            # Cursor de rotación
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        elif handle in ['tl', 'br']:
+            # Diagonal noroeste-sureste
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif handle in ['tr', 'bl']:
+            # Diagonal noreste-suroeste
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        elif handle in ['t', 'b']:
+            # Vertical
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        elif handle in ['l', 'r']:
+            # Horizontal
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        else:
+            # Cursor normal
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        
+        super().hoverMoveEvent(event)
+    
     def itemChange(self, change, value):
+        # Snap to grid cuando se está moviendo el objeto
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            new_pos = value  # QPointF
+            
+            # Prioridad 1: Snap to grid si está habilitado
+            if hasattr(self.canvas_editor, 'snap_to_grid') and self.canvas_editor.snap_to_grid:
+                grid_size_cm = 1.0  # 1 cm de cuadrícula por defecto
+                grid_size_px = cm_to_pixels(grid_size_cm, self.canvas_editor.canvas_dpi)
+                
+                snapped_x = round(new_pos.x() / grid_size_px) * grid_size_px
+                snapped_y = round(new_pos.y() / grid_size_px) * grid_size_px
+                
+                return QPointF(snapped_x, snapped_y)
+            
+            # Prioridad 2: Smart guides si no hay snap to grid
+            elif hasattr(self.canvas_editor, 'smart_guides') and not self.is_resizing and not self.is_rotating:
+                # Aplicar smart guides y snap
+                adjusted_pos = self.canvas_editor.smart_guides.detect_alignments(self, new_pos)
+                return adjusted_pos
+        
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             # Actualizar posición en canvas_item
             if hasattr(self, 'canvas_item') and hasattr(self.canvas_editor, 'canvas_dpi'):
@@ -320,6 +610,273 @@ class DraggableImageItem(QGraphicsPixmapItem):
             self.canvas_editor.bring_to_front()
         elif action == to_back:
             self.canvas_editor.send_to_back()
+
+# ==================== Item de Texto Arrastrable ====================
+
+class DraggableTextItem(QGraphicsTextItem):
+    """Item de texto editable, arrastrable y estilizable"""
+    
+    def __init__(self, text_item: TextCanvasItem, canvas_editor, parent=None):
+        super().__init__(parent)
+        self.text_item = text_item
+        self.canvas_editor = canvas_editor
+        
+        # Configuración inicial
+        self.setPlainText(text_item.text)
+        self.setDefaultTextColor(QColor(text_item.color))
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        
+        # Aplicar fuente
+        font = QFont(text_item.font_family, int(text_item.font_size))
+        font.setBold(text_item.font_weight == "bold")
+        font.setItalic(text_item.font_style == "italic")
+        font.setUnderline(text_item.underline)
+        font.setStrikeOut(text_item.strikethrough)
+        self.setFont(font)
+        
+        # Alineación
+        self.apply_alignment()
+        
+        # Transformaciones
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not text_item.locked)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.setAcceptHoverEvents(True)
+        self.setOpacity(text_item.opacity)
+        self.setZValue(text_item.z_index)
+        self.setRotation(text_item.rotation)
+        
+        # Tamaño de caja
+        self.setTextWidth(cm_to_pixels(text_item.width, canvas_editor.canvas_dpi))
+        
+        # Estado
+        self.is_editing = False
+        self.handle_size = 12
+    
+    def apply_alignment(self):
+        """Aplicar alineación de texto"""
+        cursor = self.textCursor()
+        text_format = QTextBlockFormat()
+        if self.text_item.alignment == "center":
+            text_format.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        elif self.text_item.alignment == "right":
+            text_format.setAlignment(Qt.AlignmentFlag.AlignRight)
+        elif self.text_item.alignment == "justify":
+            text_format.setAlignment(Qt.AlignmentFlag.AlignJustify)
+        else:
+            text_format.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.mergeBlockFormat(text_format)
+        self.setTextCursor(cursor)
+        cursor.clearSelection()
+        self.setTextCursor(cursor)
+    
+    def mouseDoubleClickEvent(self, event):
+        """Doble click → Modo edición"""
+        if not self.text_item.locked and event.button() == Qt.MouseButton.LeftButton:
+            self.enter_edit_mode()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
+    
+    def enter_edit_mode(self):
+        """Activar edición de texto"""
+        self.is_editing = True
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextEditorInteraction
+        )
+        self.setFocus()
+        
+        # Seleccionar todo el texto
+        cursor = self.textCursor()
+        cursor.select(QTextCursor.SelectionType.Document)
+        self.setTextCursor(cursor)
+        
+        # Cambiar cursor del item
+        self.setCursor(Qt.CursorShape.IBeamCursor)
+        
+        # Notificar al editor
+        self.canvas_editor.statusBar().showMessage("Modo edición - Presiona Esc para salir", 0)
+    
+    def exit_edit_mode(self):
+        """Salir de modo edición"""
+        self.is_editing = False
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.clearFocus()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        
+        # Actualizar texto en text_item
+        self.text_item.text = self.toPlainText()
+        
+        # Actualizar altura si cambió
+        doc_height_px = self.document().size().height()
+        self.text_item.height = pixels_to_cm(doc_height_px, self.canvas_editor.canvas_dpi)
+        
+        self.canvas_editor.save_history_state()
+        self.canvas_editor.statusBar().showMessage("Texto actualizado", 2000)
+    
+    def keyPressEvent(self, event):
+        """Manejar teclas en modo edición"""
+        if self.is_editing:
+            if event.key() == Qt.Key.Key_Escape:
+                self.exit_edit_mode()
+                event.accept()
+                return
+            # Permitir edición normal
+            super().keyPressEvent(event)
+        else:
+            # Pasar evento al canvas
+            event.ignore()
+    
+    def focusOutEvent(self, event):
+        """Salir de edición al perder foco"""
+        if self.is_editing:
+            self.exit_edit_mode()
+        super().focusOutEvent(event)
+    
+    def paint(self, painter, option, widget):
+        """Dibujar texto con efectos y controles"""
+        # Eliminar borde automático de Qt
+        option.state &= ~QStyle.StateFlag.State_Selected
+        
+        # Dibujar fondo si está habilitado
+        if self.text_item.background_color != "transparent":
+            painter.save()
+            painter.setBrush(QBrush(QColor(self.text_item.background_color)))
+            painter.setOpacity(self.text_item.background_opacity)
+            painter.drawRect(self.boundingRect())
+            painter.restore()
+        
+        # Dibujar texto
+        super().paint(painter, option, widget)
+        
+        # Dibujar borde de selección y handles si está seleccionado
+        if self.isSelected() and not self.is_editing:
+            self.draw_selection_border(painter)
+    
+    def draw_selection_border(self, painter):
+        """Dibujar borde y handles cuando está seleccionado"""
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        rect = self.boundingRect()
+        
+        # Color turquesa profesional
+        canva_color = QColor(0, 196, 204)
+        
+        # Borde
+        pen = QPen(canva_color, 2, Qt.PenStyle.SolidLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(rect)
+        
+        # Handles en esquinas y lados (similar a imágenes)
+        painter.setBrush(QBrush(QColor(255, 255, 255)))
+        painter.setPen(QPen(canva_color, 2))
+        
+        handle_size = self.handle_size
+        
+        # Handles de esquinas
+        corners = [
+            QPointF(rect.left(), rect.top()),
+            QPointF(rect.right(), rect.top()),
+            QPointF(rect.left(), rect.bottom()),
+            QPointF(rect.right(), rect.bottom()),
+        ]
+        
+        for corner in corners:
+            painter.drawEllipse(corner, handle_size/2, handle_size/2)
+        
+        # Handles de lados
+        sides = [
+            QPointF((rect.left() + rect.right())/2, rect.top()),
+            QPointF((rect.left() + rect.right())/2, rect.bottom()),
+            QPointF(rect.left(), (rect.top() + rect.bottom())/2),
+            QPointF(rect.right(), (rect.top() + rect.bottom())/2),
+        ]
+        
+        for side in sides:
+            painter.drawEllipse(side, handle_size/2, handle_size/2)
+        
+        painter.restore()
+    
+    def itemChange(self, change, value):
+        """Manejar cambios en el item con smart guides"""
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            new_pos = value  # QPointF
+            
+            # Aplicar smart guides si no está en modo edición
+            if not self.is_editing and hasattr(self.canvas_editor, 'smart_guides'):
+                # Smart guides y snap
+                adjusted_pos = self.canvas_editor.smart_guides.detect_alignments(self, new_pos)
+                return adjusted_pos
+        
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            if hasattr(self, 'text_item') and hasattr(self.canvas_editor, 'canvas_dpi'):
+                dpi = self.canvas_editor.canvas_dpi
+                pos = self.pos()
+                self.text_item.x = pixels_to_cm(pos.x(), dpi)
+                self.text_item.y = pixels_to_cm(pos.y(), dpi)
+        
+        return super().itemChange(change, value)
+    
+    def contextMenuEvent(self, event):
+        """Menú contextual para texto"""
+        if self.text_item.locked:
+            return
+        
+        menu = QMenu()
+        
+        edit_action = menu.addAction("✏️ Editar Texto")
+        menu.addSeparator()
+        
+        # Estilo
+        style_menu = menu.addMenu("🎨 Estilo")
+        bold_action = style_menu.addAction("Negrita")
+        bold_action.setCheckable(True)
+        bold_action.setChecked(self.text_item.font_weight == "bold")
+        
+        italic_action = style_menu.addAction("Cursiva")
+        italic_action.setCheckable(True)
+        italic_action.setChecked(self.text_item.font_style == "italic")
+        
+        underline_action = style_menu.addAction("Subrayado")
+        underline_action.setCheckable(True)
+        underline_action.setChecked(self.text_item.underline)
+        
+        menu.addSeparator()
+        
+        # Alineación
+        align_menu = menu.addMenu("⬌ Alineación")
+        align_left = align_menu.addAction("⬅️ Izquierda")
+        align_center = align_menu.addAction("↔️ Centro")
+        align_right = align_menu.addAction("➡️ Derecha")
+        
+        menu.addSeparator()
+        
+        duplicate_action = menu.addAction("📋 Duplicar")
+        delete_action = menu.addAction("🗑️ Eliminar")
+        
+        action = menu.exec(event.screenPos())
+        
+        if action == edit_action:
+            self.enter_edit_mode()
+        elif action == bold_action:
+            self.canvas_editor.toggle_text_bold_for_item(self)
+        elif action == italic_action:
+            self.canvas_editor.toggle_text_italic_for_item(self)
+        elif action == underline_action:
+            self.canvas_editor.toggle_text_underline_for_item(self)
+        elif action == align_left:
+            self.canvas_editor.set_text_alignment_for_item(self, "left")
+        elif action == align_center:
+            self.canvas_editor.set_text_alignment_for_item(self, "center")
+        elif action == align_right:
+            self.canvas_editor.set_text_alignment_for_item(self, "right")
+        elif action == duplicate_action:
+            self.canvas_editor.duplicate_text_item(self)
+        elif action == delete_action:
+            self.canvas_editor.delete_text_item(self)
 
 # ==================== Editor de Plantillas ====================
 
@@ -502,6 +1059,248 @@ class LayersListWidget(QListWidget):
         """Emitir señal cuando se reordenan las capas"""
         self.layerOrderChanged.emit()
 
+# ==================== Custom Graphics View ====================
+
+class CustomGraphicsView(QGraphicsView):
+    """Vista personalizada con zoom mejorado mediante Ctrl+Scroll"""
+    
+    def __init__(self, scene, canvas_editor, parent=None):
+        super().__init__(scene, parent)
+        self.canvas_editor = canvas_editor
+    
+    def wheelEvent(self, event):
+        """Zoom con rueda del mouse (Ctrl + Scroll)"""
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            # Zoom hacia la posición del cursor
+            delta = event.angleDelta().y()
+            zoom_factor = 1.15 if delta > 0 else 1/1.15
+            
+            # Guardar posición del mouse en la escena
+            old_pos = self.mapToScene(event.position().toPoint())
+            
+            # Aplicar zoom
+            self.scale(zoom_factor, zoom_factor)
+            
+            # Ajustar para mantener punto bajo cursor
+            new_pos = self.mapToScene(event.position().toPoint())
+            delta_pos = new_pos - old_pos
+            self.translate(delta_pos.x(), delta_pos.y())
+            
+            # Actualizar label de zoom en editor
+            if hasattr(self.canvas_editor, 'update_zoom_display'):
+                self.canvas_editor.update_zoom_display()
+            
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+# ==================== Smart Guides Manager ====================
+
+class SmartGuideManager:
+    """
+    Gestor de guías inteligentes para alineación automática estilo Canva/Figma
+    
+    Características:
+    - Detecta alineación entre objetos al mover
+    - Muestra guías visuales temporales
+    - Aplica snap suave para alineación precisa
+    """
+    
+    def __init__(self, scene, canvas_editor):
+        self.scene = scene
+        self.canvas_editor = canvas_editor
+        
+        # Líneas de guía activas
+        self.guide_lines: List[QGraphicsLineItem] = []
+        
+        # Configuración
+        self.snap_threshold = 8  # Umbral en píxeles para snap
+        self.guide_color = QColor(255, 77, 212)  # #ff4dd4 (fucsia Canva)
+        self.guide_opacity = 0.6
+        self.guide_width = 1.5
+        
+        # Estado
+        self.enabled = True
+    
+    def clear_guides(self):
+        """Eliminar todas las guías visibles"""
+        for line in self.guide_lines:
+            self.scene.removeItem(line)
+        self.guide_lines.clear()
+    
+    def draw_vertical_guide(self, x: float):
+        """Dibujar guía vertical en posición x"""
+        # Obtener límites del canvas
+        canvas_rect = self.scene.sceneRect()
+        
+        # Crear línea vertical
+        line = QGraphicsLineItem(x, canvas_rect.top(), x, canvas_rect.bottom())
+        
+        # Estilo de la guía
+        pen = QPen(self.guide_color, self.guide_width)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        line.setPen(pen)
+        line.setOpacity(self.guide_opacity)
+        
+        # No seleccionable y siempre al frente
+        line.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        line.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        line.setZValue(99999)  # Siempre visible
+        
+        self.scene.addItem(line)
+        self.guide_lines.append(line)
+    
+    def draw_horizontal_guide(self, y: float):
+        """Dibujar guía horizontal en posición y"""
+        # Obtener límites del canvas
+        canvas_rect = self.scene.sceneRect()
+        
+        # Crear línea horizontal
+        line = QGraphicsLineItem(canvas_rect.left(), y, canvas_rect.right(), y)
+        
+        # Estilo de la guía
+        pen = QPen(self.guide_color, self.guide_width)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        line.setPen(pen)
+        line.setOpacity(self.guide_opacity)
+        
+        # No seleccionable y siempre al frente
+        line.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        line.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        line.setZValue(99999)
+        
+        self.scene.addItem(line)
+        self.guide_lines.append(line)
+    
+    def get_item_bounds(self, item):
+        """Obtener bordes y centro de un item"""
+        if isinstance(item, (DraggableImageItem, DraggableTextItem)):
+            rect = item.sceneBoundingRect()
+            return {
+                'left': rect.left(),
+                'right': rect.right(),
+                'top': rect.top(),
+                'bottom': rect.bottom(),
+                'center_x': rect.center().x(),
+                'center_y': rect.center().y(),
+                'rect': rect
+            }
+        return None
+    
+    def detect_alignments(self, moving_item, new_pos):
+        """
+        Detectar alineaciones potenciales y aplicar snap
+        
+        Returns:
+            QPointF con posición ajustada por snap
+        """
+        if not self.enabled:
+            return new_pos
+        
+        # Limpiar guías previas
+        self.clear_guides()
+        
+        # Obtener bounds del item en movimiento en su nueva posición
+        moving_rect = moving_item.sceneBoundingRect()
+        offset = new_pos - moving_item.pos()
+        moving_rect.translate(offset)
+        
+        moving_bounds = {
+            'left': moving_rect.left(),
+            'right': moving_rect.right(),
+            'top': moving_rect.top(),
+            'bottom': moving_rect.bottom(),
+            'center_x': moving_rect.center().x(),
+            'center_y': moving_rect.center().y(),
+        }
+        
+        # Canvas center para alineación con canvas
+        canvas_rect = self.scene.sceneRect()
+        canvas_center_x = canvas_rect.center().x()
+        canvas_center_y = canvas_rect.center().y()
+        
+        # Variables para snap
+        snap_x = None
+        snap_y = None
+        
+        # Verificar alineación con canvas
+        if abs(moving_bounds['center_x'] - canvas_center_x) < self.snap_threshold:
+            snap_x = canvas_center_x - (moving_rect.center().x() - moving_rect.left()) + (moving_rect.width() / 2)
+            self.draw_vertical_guide(canvas_center_x)
+        
+        if abs(moving_bounds['center_y'] - canvas_center_y) < self.snap_threshold:
+            snap_y = canvas_center_y - (moving_rect.center().y() - moving_rect.top()) + (moving_rect.height() / 2)
+            self.draw_horizontal_guide(canvas_center_y)
+        
+        # Verificar alineación con otros items
+        for item in self.scene.items():
+            if item == moving_item:
+                continue
+            
+            # Solo considerar items movibles (imágenes y textos)
+            if not isinstance(item, (DraggableImageItem, DraggableTextItem)):
+                continue
+            
+            other_bounds = self.get_item_bounds(item)
+            if not other_bounds:
+                continue
+            
+            # Alineación de centros
+            if snap_x is None and abs(moving_bounds['center_x'] - other_bounds['center_x']) < self.snap_threshold:
+                snap_x = other_bounds['center_x'] - (moving_rect.center().x() - moving_rect.left()) + (moving_rect.width() / 2)
+                self.draw_vertical_guide(other_bounds['center_x'])
+            
+            if snap_y is None and abs(moving_bounds['center_y'] - other_bounds['center_y']) < self.snap_threshold:
+                snap_y = other_bounds['center_y'] - (moving_rect.center().y() - moving_rect.top()) + (moving_rect.height() / 2)
+                self.draw_horizontal_guide(other_bounds['center_y'])
+            
+            # Alineación de bordes
+            # Left edge alignment
+            if snap_x is None and abs(moving_bounds['left'] - other_bounds['left']) < self.snap_threshold:
+                snap_x = other_bounds['left']
+                self.draw_vertical_guide(other_bounds['left'])
+            
+            # Right edge alignment
+            if snap_x is None and abs(moving_bounds['right'] - other_bounds['right']) < self.snap_threshold:
+                snap_x = other_bounds['right'] - moving_rect.width()
+                self.draw_vertical_guide(other_bounds['right'])
+            
+            # Top edge alignment
+            if snap_y is None and abs(moving_bounds['top'] - other_bounds['top']) < self.snap_threshold:
+                snap_y = other_bounds['top']
+                self.draw_horizontal_guide(other_bounds['top'])
+            
+            # Bottom edge alignment
+            if snap_y is None and abs(moving_bounds['bottom'] - other_bounds['bottom']) < self.snap_threshold:
+                snap_y = other_bounds['bottom'] - moving_rect.height()
+                self.draw_horizontal_guide(other_bounds['bottom'])
+            
+            # Alineación cruzada (centro de uno con borde de otro)
+            if snap_x is None and abs(moving_bounds['center_x'] - other_bounds['left']) < self.snap_threshold:
+                snap_x = other_bounds['left'] - (moving_rect.center().x() - moving_rect.left()) + (moving_rect.width() / 2)
+                self.draw_vertical_guide(other_bounds['left'])
+            
+            if snap_x is None and abs(moving_bounds['center_x'] - other_bounds['right']) < self.snap_threshold:
+                snap_x = other_bounds['right'] - (moving_rect.center().x() - moving_rect.left()) + (moving_rect.width() / 2)
+                self.draw_vertical_guide(other_bounds['right'])
+            
+            if snap_y is None and abs(moving_bounds['center_y'] - other_bounds['top']) < self.snap_threshold:
+                snap_y = other_bounds['top'] - (moving_rect.center().y() - moving_rect.top()) + (moving_rect.height() / 2)
+                self.draw_horizontal_guide(other_bounds['top'])
+            
+            if snap_y is None and abs(moving_bounds['center_y'] - other_bounds['bottom']) < self.snap_threshold:
+                snap_y = other_bounds['bottom'] - (moving_rect.center().y() - moving_rect.top()) + (moving_rect.height() / 2)
+                self.draw_horizontal_guide(other_bounds['bottom'])
+        
+        # Aplicar snap si se detectó
+        result_pos = QPointF(new_pos)
+        if snap_x is not None:
+            result_pos.setX(snap_x)
+        if snap_y is not None:
+            result_pos.setY(snap_y)
+        
+        return result_pos
+
 # ==================== Canvas Principal ====================
 
 class CanvasEditor(QMainWindow):
@@ -524,6 +1323,9 @@ class CanvasEditor(QMainWindow):
         self.canvas_images: List[CanvasImageItem] = []
         self.loaded_images: List[str] = []
         
+        # Textos en el canvas
+        self.text_items: List[TextCanvasItem] = []
+        
         # Zoom
         self.zoom_factor = 1.0
         
@@ -538,6 +1340,7 @@ class CanvasEditor(QMainWindow):
         
         # Clipboard
         self.clipboard_items: List[CanvasImageItem] = []
+        self.clipboard_center: Tuple[float, float] = (0.0, 0.0)
         
         self.setWindowTitle("🎨 Canvas Editor Profesional")
         self.resize(1600, 900)
@@ -697,6 +1500,9 @@ class CanvasEditor(QMainWindow):
         templates_layout.addLayout(template_btns)
         templates_group.setLayout(templates_layout)
         
+        # Herramientas de texto
+        text_group = self.setup_text_tool_ui()
+        
         # Opciones de vista
         view_group = QGroupBox("👁️ Vista")
         view_layout = QVBoxLayout()
@@ -710,14 +1516,21 @@ class CanvasEditor(QMainWindow):
         self.snap_check.stateChanged.connect(self.toggle_snap)
         self.apply_checkbox_style(self.snap_check)
         
+        self.smart_guides_check = QCheckBox("Guías inteligentes")
+        self.smart_guides_check.setChecked(True)  # Activado por defecto
+        self.smart_guides_check.stateChanged.connect(self.toggle_smart_guides)
+        self.apply_checkbox_style(self.smart_guides_check)
+        
         view_layout.addWidget(self.grid_check)
         view_layout.addWidget(self.snap_check)
+        view_layout.addWidget(self.smart_guides_check)
         view_group.setLayout(view_layout)
         
         # Ensamblar panel izquierdo
         left_panel.addWidget(config_group)
         left_panel.addWidget(apply_canvas_btn)
         left_panel.addWidget(images_group)
+        left_panel.addWidget(text_group)
         left_panel.addWidget(templates_group)
         left_panel.addWidget(view_group)
         left_panel.addStretch()
@@ -757,9 +1570,13 @@ class CanvasEditor(QMainWindow):
         toolbar.addWidget(undo_btn)
         toolbar.addWidget(redo_btn)
         
-        # Graphics View para el canvas
+        # Graphics View para el canvas (usando vista personalizada)
         self.scene = QGraphicsScene()
-        self.view = QGraphicsView(self.scene)
+        
+        # Inicializar Smart Guides Manager
+        self.smart_guides = SmartGuideManager(self.scene, self)
+        
+        self.view = CustomGraphicsView(self.scene, self)
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
@@ -1216,7 +2033,24 @@ class CanvasEditor(QMainWindow):
         """Actualizar panel de propiedades desde selección"""
         selected = [item for item in self.scene.selectedItems() if isinstance(item, DraggableImageItem)]
         
+        if len(selected) == 0:
+            # Deshabilitar panel si no hay selección
+            self.prop_x.setEnabled(False)
+            self.prop_y.setEnabled(False)
+            self.prop_width.setEnabled(False)
+            self.prop_height.setEnabled(False)
+            self.prop_rotation.setEnabled(False)
+            self.prop_opacity.setEnabled(False)
+            return
+        
+        # Habilitar controles
+        self.prop_x.setEnabled(True)
+        self.prop_y.setEnabled(True)
+        self.prop_rotation.setEnabled(True)
+        self.prop_opacity.setEnabled(True)
+        
         if len(selected) == 1:
+            # Un solo objeto seleccionado
             canvas_item = selected[0].canvas_item
             
             self.prop_x.blockSignals(True)
@@ -1233,6 +2067,54 @@ class CanvasEditor(QMainWindow):
             self.prop_rotation.setValue(int(canvas_item.rotation))
             self.prop_opacity.setValue(int(canvas_item.opacity * 100))
             self.opacity_label.setText(f"{int(canvas_item.opacity * 100)}%")
+            
+            # Habilitar width y height
+            self.prop_width.setEnabled(True)
+            self.prop_height.setEnabled(True)
+            
+            self.prop_x.blockSignals(False)
+            self.prop_y.blockSignals(False)
+            self.prop_width.blockSignals(False)
+            self.prop_height.blockSignals(False)
+            self.prop_rotation.blockSignals(False)
+            self.prop_opacity.blockSignals(False)
+        
+        else:
+            # Múltiple selección
+            self.prop_x.blockSignals(True)
+            self.prop_y.blockSignals(True)
+            self.prop_width.blockSignals(True)
+            self.prop_height.blockSignals(True)
+            self.prop_rotation.blockSignals(True)
+            self.prop_opacity.blockSignals(True)
+            
+            # Calcular promedios
+            avg_x = sum(item.canvas_item.x for item in selected) / len(selected)
+            avg_y = sum(item.canvas_item.y for item in selected) / len(selected)
+            avg_opacity = sum(item.canvas_item.opacity for item in selected) / len(selected)
+            
+            self.prop_x.setValue(avg_x)
+            self.prop_y.setValue(avg_y)
+            self.prop_opacity.setValue(int(avg_opacity * 100))
+            self.opacity_label.setText(f"{int(avg_opacity * 100)}%")
+            
+            # Verificar si todas tienen la misma rotación
+            rotations = [item.canvas_item.rotation for item in selected]
+            if all(abs(r - rotations[0]) < 0.1 for r in rotations):
+                # Todas tienen la misma rotación
+                self.prop_rotation.setValue(int(rotations[0]))
+                self.prop_rotation.setSpecialValueText("")
+            else:
+                # Rotaciones diferentes
+                self.prop_rotation.setValue(0)
+                self.prop_rotation.setSpecialValueText("Múltiple")
+            
+            # Deshabilitar width/height para múltiple selección
+            # (diferentes tamaños, no tiene sentido mostrar promedio)
+            self.prop_width.setEnabled(False)
+            self.prop_height.setEnabled(False)
+            self.prop_width.setValue(0)
+            self.prop_height.setValue(0)
             
             self.prop_x.blockSignals(False)
             self.prop_y.blockSignals(False)
@@ -1386,14 +2268,17 @@ class CanvasEditor(QMainWindow):
         if not selected:
             return
         
+        temp_manager = TempFileManager.get_instance()
+        
         for item in selected:
             try:
                 pil_img = Image.open(item.canvas_item.image_path)
                 pil_img = pil_img.transpose(Image.FLIP_LEFT_RIGHT)
                 
-                # Guardar temporalmente
+                # Guardar temporalmente y registrar en el gestor
                 temp_path = os.path.join(tempfile.gettempdir(), f"flipped_{uuid.uuid4()}.png")
                 pil_img.save(temp_path)
+                temp_manager.register_temp_file(temp_path)
                 item.canvas_item.image_path = temp_path
                 
                 # Actualizar pixmap
@@ -1434,9 +2319,11 @@ class CanvasEditor(QMainWindow):
                 pil_img = Image.open(item.canvas_item.image_path)
                 pil_img = pil_img.transpose(Image.FLIP_TOP_BOTTOM)
                 
-                # Guardar temporalmente
+                # Guardar temporalmente y registrar en el gestor
+                temp_manager = TempFileManager.get_instance()
                 temp_path = os.path.join(tempfile.gettempdir(), f"flipped_{uuid.uuid4()}.png")
                 pil_img.save(temp_path)
+                temp_manager.register_temp_file(temp_path)
                 item.canvas_item.image_path = temp_path
                 
                 # Actualizar pixmap
@@ -1597,19 +2484,27 @@ class CanvasEditor(QMainWindow):
         self.statusBar().showMessage("Deseleccionado", 2000)
     
     def copy_selected(self):
-        """Copiar imágenes seleccionadas al clipboard"""
+        """Copiar imágenes seleccionadas al clipboard preservando posiciones relativas"""
         selected = [item for item in self.scene.selectedItems() if isinstance(item, DraggableImageItem)]
         
         if not selected:
             return
         
+        # Calcular centroide de la selección
+        center_x = sum(item.canvas_item.x for item in selected) / len(selected)
+        center_y = sum(item.canvas_item.y for item in selected) / len(selected)
+        
         self.clipboard_items = []
         for item in selected:
-            # Copiar canvas_item
+            # Guardar posición RELATIVA al centro
+            offset_x = item.canvas_item.x - center_x
+            offset_y = item.canvas_item.y - center_y
+            
+            # Copiar canvas_item con posiciones relativas
             copied = CanvasImageItem(
                 image_path=item.canvas_item.image_path,
-                x=item.canvas_item.x,
-                y=item.canvas_item.y,
+                x=offset_x,  # RELATIVO al centro
+                y=offset_y,  # RELATIVO al centro
                 width=item.canvas_item.width,
                 height=item.canvas_item.height,
                 rotation=item.canvas_item.rotation,
@@ -1619,19 +2514,29 @@ class CanvasEditor(QMainWindow):
             )
             self.clipboard_items.append(copied)
         
+        # Guardar el centroide para paste
+        self.clipboard_center = (center_x, center_y)
         self.statusBar().showMessage(f"{len(selected)} imagen(es) copiada(s)", 2000)
     
     def paste_from_clipboard(self):
-        """Pegar imágenes desde clipboard"""
+        """Pegar imágenes desde clipboard preservando layout relativo"""
         if not self.clipboard_items:
             return
         
+        # Calcular nueva posición del centro (offset +2cm del centro original)
+        paste_center_x = self.clipboard_center[0] + 2.0
+        paste_center_y = self.clipboard_center[1] + 2.0
+        
         for canvas_item in self.clipboard_items:
-            # Crear nueva instancia con offset
+            # Calcular posición absoluta desde la relativa
+            new_x = paste_center_x + canvas_item.x  # x es relativo al centro
+            new_y = paste_center_y + canvas_item.y  # y es relativo al centro
+            
+            # Crear nueva instancia
             new_item = CanvasImageItem(
                 image_path=canvas_item.image_path,
-                x=canvas_item.x + 1.0,
-                y=canvas_item.y + 1.0,
+                x=new_x,
+                y=new_y,
                 width=canvas_item.width,
                 height=canvas_item.height,
                 rotation=canvas_item.rotation,
@@ -1733,7 +2638,9 @@ class CanvasEditor(QMainWindow):
             self.statusBar().showMessage("Rehacer", 2000)
     
     def restore_state(self, state_json: str):
-        """Restaurar estado desde JSON"""
+        """Restaurar estado desde JSON con manejo robusto de errores"""
+        failed_images = []
+        
         try:
             state = json.loads(state_json)
             
@@ -1744,60 +2651,158 @@ class CanvasEditor(QMainWindow):
             
             self.canvas_images.clear()
             
-            # Restaurar imágenes
+            # Restaurar imágenes con manejo robusto de errores
             for img_data in state['images']:
-                canvas_item = CanvasImageItem(
-                    image_path=img_data['path'],
-                    x=img_data['x'],
-                    y=img_data['y'],
-                    width=img_data['width'],
-                    height=img_data['height'],
-                    rotation=img_data['rotation'],
-                    z_index=img_data['z_index'],
-                    opacity=img_data['opacity'],
-                    locked=img_data['locked'],
-                    visible=img_data['visible'],
-                    original_aspect_ratio=img_data['aspect_ratio']
-                )
-                canvas_item.uuid = img_data['uuid']
-                
-                # Cargar imagen
-                pil_img = Image.open(canvas_item.image_path)
-                
-                if pil_img.mode == 'RGBA':
-                    qimg = ImageQt.ImageQt(pil_img)
-                    pixmap = QPixmap.fromImage(qimg)
-                else:
-                    pil_img_rgb = pil_img.convert('RGB')
-                    data = pil_img_rgb.tobytes("raw", "RGB")
-                    qimg = QImage(data, pil_img_rgb.width, pil_img_rgb.height, QImage.Format.Format_RGB888)
-                    pixmap = QPixmap.fromImage(qimg)
-                
-                width_px = cm_to_pixels(canvas_item.width, self.canvas_dpi)
-                height_px = cm_to_pixels(canvas_item.height, self.canvas_dpi)
-                
-                scaled_pixmap = pixmap.scaled(
-                    int(width_px), int(height_px),
-                    Qt.AspectRatioMode.IgnoreAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
-                )
-                
-                graphic_item = DraggableImageItem(scaled_pixmap, canvas_item, self)
-                x_px = cm_to_pixels(canvas_item.x, self.canvas_dpi)
-                y_px = cm_to_pixels(canvas_item.y, self.canvas_dpi)
-                graphic_item.setPos(x_px, y_px)
-                graphic_item.setRotation(canvas_item.rotation)
-                graphic_item.setOpacity(canvas_item.opacity)
-                graphic_item.setZValue(canvas_item.z_index)
-                graphic_item.setVisible(canvas_item.visible)
-                
-                self.scene.addItem(graphic_item)
-                self.canvas_images.append(canvas_item)
+                try:
+                    # Verificar si el archivo existe antes de intentar cargarlo
+                    image_path = img_data['path']
+                    if not os.path.exists(image_path):
+                        failed_images.append({
+                            'path': image_path,
+                            'reason': 'Archivo no encontrado'
+                        })
+                        continue
+                    
+                    canvas_item = CanvasImageItem(
+                        image_path=image_path,
+                        x=img_data['x'],
+                        y=img_data['y'],
+                        width=img_data['width'],
+                        height=img_data['height'],
+                        rotation=img_data['rotation'],
+                        z_index=img_data['z_index'],
+                        opacity=img_data['opacity'],
+                        locked=img_data['locked'],
+                        visible=img_data['visible'],
+                        original_aspect_ratio=img_data['aspect_ratio']
+                    )
+                    canvas_item.uuid = img_data['uuid']
+                    
+                    # Cargar imagen con manejo de errores
+                    try:
+                        pil_img = Image.open(canvas_item.image_path)
+                        
+                        if pil_img.mode == 'RGBA':
+                            qimg = ImageQt.ImageQt(pil_img)
+                            pixmap = QPixmap.fromImage(qimg)
+                        else:
+                            pil_img_rgb = pil_img.convert('RGB')
+                            data = pil_img_rgb.tobytes("raw", "RGB")
+                            qimg = QImage(data, pil_img_rgb.width, pil_img_rgb.height, QImage.Format.Format_RGB888)
+                            pixmap = QPixmap.fromImage(qimg)
+                        
+                        width_px = cm_to_pixels(canvas_item.width, self.canvas_dpi)
+                        height_px = cm_to_pixels(canvas_item.height, self.canvas_dpi)
+                        
+                        scaled_pixmap = pixmap.scaled(
+                            int(width_px), int(height_px),
+                            Qt.AspectRatioMode.IgnoreAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation
+                        )
+                        
+                        graphic_item = DraggableImageItem(scaled_pixmap, canvas_item, self)
+                        x_px = cm_to_pixels(canvas_item.x, self.canvas_dpi)
+                        y_px = cm_to_pixels(canvas_item.y, self.canvas_dpi)
+                        graphic_item.setPos(x_px, y_px)
+                        graphic_item.setRotation(canvas_item.rotation)
+                        graphic_item.setOpacity(canvas_item.opacity)
+                        graphic_item.setZValue(canvas_item.z_index)
+                        graphic_item.setVisible(canvas_item.visible)
+                        
+                        self.scene.addItem(graphic_item)
+                        self.canvas_images.append(canvas_item)
+                        
+                    except Exception as e:
+                        failed_images.append({
+                            'path': image_path,
+                            'reason': f'Error al cargar: {str(e)}'
+                        })
+                        print(f"Error cargando imagen {image_path}: {e}")
+                        continue
+                        
+                except KeyError as e:
+                    print(f"Error en datos de imagen: falta campo {e}")
+                    failed_images.append({
+                        'path': img_data.get('path', 'desconocida'),
+                        'reason': f'Datos incompletos: {str(e)}'
+                    })
+                    continue
+                except Exception as e:
+                    print(f"Error restaurando imagen: {e}")
+                    failed_images.append({
+                        'path': img_data.get('path', 'desconocida'),
+                        'reason': str(e)
+                    })
+                    continue
             
             self.update_layers_list()
             
+            # Mostrar diálogo con imágenes fallidas si las hay
+            if failed_images:
+                self.show_missing_images_dialog(failed_images)
+            
+        except json.JSONDecodeError as e:
+            QMessageBox.critical(self, "Error", 
+                               f"Error al decodificar JSON del historial:\n{e}")
+            print(f"Error de JSON en restore_state: {e}")
         except Exception as e:
+            QMessageBox.critical(self, "Error Crítico", 
+                               f"No se pudo restaurar el estado:\n{e}")
             print(f"Error restaurando estado: {e}")
+    
+    def show_missing_images_dialog(self, failed_images):
+        """Mostrar diálogo con imágenes que no se pudieron cargar"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("⚠️ Imágenes No Cargadas")
+        dialog.setMinimumWidth(500)
+        layout = QVBoxLayout()
+        
+        # Mensaje principal
+        msg = QLabel(f"<b>{len(failed_images)} imagen(es) no se pudieron cargar:</b>")
+        layout.addWidget(msg)
+        
+        # Lista de imágenes fallidas
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        list_widget = QWidget()
+        list_layout = QVBoxLayout()
+        
+        for img_info in failed_images:
+            item_layout = QHBoxLayout()
+            
+            # Ícono de error
+            icon_label = QLabel("❌")
+            icon_label.setFixedWidth(30)
+            item_layout.addWidget(icon_label)
+            
+            # Información de la imagen
+            info_label = QLabel(f"<b>Ruta:</b> {img_info['path']}<br>"
+                              f"<b>Razón:</b> {img_info['reason']}")
+            info_label.setWordWrap(True)
+            item_layout.addWidget(info_label, 1)
+            
+            item_widget = QWidget()
+            item_widget.setLayout(item_layout)
+            item_widget.setStyleSheet("QWidget { border: 1px solid #ccc; padding: 5px; margin: 2px; }")
+            list_layout.addWidget(item_widget)
+        
+        list_widget.setLayout(list_layout)
+        scroll.setWidget(list_widget)
+        scroll.setMaximumHeight(300)
+        layout.addWidget(scroll)
+        
+        # Mensaje de ayuda
+        help_msg = QLabel("<i>Estas imágenes fueron omitidas. El resto del estado se restauró correctamente.</i>")
+        help_msg.setWordWrap(True)
+        layout.addWidget(help_msg)
+        
+        # Botones
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        button_box.accepted.connect(dialog.accept)
+        layout.addWidget(button_box)
+        
+        dialog.setLayout(layout)
+        dialog.exec()
     
     def load_custom_templates(self):
         """Cargar plantillas personalizadas desde archivo"""
@@ -1898,11 +2903,17 @@ class CanvasEditor(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         
-        for item in self.scene.items():
-            if isinstance(item, DraggableImageItem):
+        # Limpiar guías smart antes de eliminar items
+        if hasattr(self, 'smart_guides'):
+            self.smart_guides.clear_guides()
+        
+        # Eliminar todos los items del canvas
+        for item in list(self.scene.items()):  # Usar list() para evitar modificar durante iteración
+            if isinstance(item, (DraggableImageItem, DraggableTextItem)):
                 self.scene.removeItem(item)
         
         self.canvas_images.clear()
+        self.text_items.clear()  # También limpiar textos
         
         if template_name == "4x4":
             self.apply_photo_grid_template(2, 2, 3.5, 4.5, 0.5, 0.5)
@@ -1930,11 +2941,17 @@ class CanvasEditor(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         
-        for item in self.scene.items():
-            if isinstance(item, DraggableImageItem):
+        # Limpiar guías smart antes de eliminar items
+        if hasattr(self, 'smart_guides'):
+            self.smart_guides.clear_guides()
+        
+        # Eliminar todos los items del canvas
+        for item in list(self.scene.items()):  # Usar list() para evitar modificar durante iteración
+            if isinstance(item, (DraggableImageItem, DraggableTextItem)):
                 self.scene.removeItem(item)
         
         self.canvas_images.clear()
+        self.text_items.clear()  # También limpiar textos
         
         self.apply_photo_grid_template(
             template.cols,
@@ -2116,6 +3133,304 @@ class CanvasEditor(QMainWindow):
         elif "300" in dpi_text:
             self.canvas_dpi = 300
     
+    def setup_text_tool_ui(self):
+        """Panel de herramientas de texto"""
+        text_group = QGroupBox("✏️ Herramientas de Texto")
+        text_layout = QVBoxLayout()
+        
+        # Botón para agregar texto
+        add_text_btn = QPushButton("➕ Agregar Texto")
+        add_text_btn.clicked.connect(self.add_text_to_canvas)
+        add_text_btn.setStyleSheet("""
+            QPushButton {
+                background: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background: #45a049;
+            }
+        """)
+        
+        # Propiedades de texto (cuando hay texto seleccionado)
+        text_props_widget = QWidget()
+        text_props_layout = QFormLayout()
+        
+        self.text_font_combo = QFontComboBox()
+        self.text_font_combo.currentFontChanged.connect(self.update_text_font)
+        
+        self.text_size_spin = QSpinBox()
+        self.text_size_spin.setRange(6, 200)
+        self.text_size_spin.setValue(16)
+        self.text_size_spin.setSuffix(" pt")
+        self.text_size_spin.valueChanged.connect(self.update_text_size)
+        
+        self.text_color_btn = QPushButton("Color")
+        self.text_color_btn.clicked.connect(self.choose_text_color)
+        
+        # Botones de estilo
+        style_layout = QHBoxLayout()
+        
+        self.text_bold_btn = QPushButton("B")
+        self.text_bold_btn.setCheckable(True)
+        self.text_bold_btn.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        self.text_bold_btn.clicked.connect(self.toggle_text_bold)
+        self.text_bold_btn.setMaximumWidth(30)
+        
+        self.text_italic_btn = QPushButton("I")
+        self.text_italic_btn.setCheckable(True)
+        font = QFont("Arial", 10)
+        font.setItalic(True)
+        self.text_italic_btn.setFont(font)
+        self.text_italic_btn.clicked.connect(self.toggle_text_italic)
+        self.text_italic_btn.setMaximumWidth(30)
+        
+        self.text_underline_btn = QPushButton("U")
+        self.text_underline_btn.setCheckable(True)
+        font = QFont("Arial", 10)
+        font.setUnderline(True)
+        self.text_underline_btn.setFont(font)
+        self.text_underline_btn.clicked.connect(self.toggle_text_underline)
+        self.text_underline_btn.setMaximumWidth(30)
+        
+        style_layout.addWidget(self.text_bold_btn)
+        style_layout.addWidget(self.text_italic_btn)
+        style_layout.addWidget(self.text_underline_btn)
+        
+        # Alineación
+        align_layout = QHBoxLayout()
+        
+        self.text_align_left_btn = QPushButton("⬅️")
+        self.text_align_left_btn.clicked.connect(lambda: self.set_text_alignment("left"))
+        self.text_align_left_btn.setMaximumWidth(30)
+        
+        self.text_align_center_btn = QPushButton("↔️")
+        self.text_align_center_btn.clicked.connect(lambda: self.set_text_alignment("center"))
+        self.text_align_center_btn.setMaximumWidth(30)
+        
+        self.text_align_right_btn = QPushButton("➡️")
+        self.text_align_right_btn.clicked.connect(lambda: self.set_text_alignment("right"))
+        self.text_align_right_btn.setMaximumWidth(30)
+        
+        align_layout.addWidget(self.text_align_left_btn)
+        align_layout.addWidget(self.text_align_center_btn)
+        align_layout.addWidget(self.text_align_right_btn)
+        
+        text_props_layout.addRow("Fuente:", self.text_font_combo)
+        text_props_layout.addRow("Tamaño:", self.text_size_spin)
+        text_props_layout.addRow("Color:", self.text_color_btn)
+        text_props_layout.addRow("Estilo:", style_layout)
+        text_props_layout.addRow("Alineación:", align_layout)
+        
+        text_props_widget.setLayout(text_props_layout)
+        text_props_widget.setEnabled(False)  # Habilitar cuando haya texto seleccionado
+        self.text_props_widget = text_props_widget
+        
+        text_layout.addWidget(add_text_btn)
+        text_layout.addWidget(text_props_widget)
+        text_group.setLayout(text_layout)
+        
+        return text_group
+    
+    def add_text_to_canvas(self):
+        """Agregar nuevo texto al canvas"""
+        # Posición central del canvas
+        x_cm = self.canvas_width_cm / 2 - 5
+        y_cm = self.canvas_height_cm / 2 - 1
+        
+        text_item = TextCanvasItem(
+            text="Doble click para editar",
+            x=x_cm,
+            y=y_cm,
+            width=10.0,  # 10 cm de ancho
+            height=2.0,
+            font_size=24.0,
+            z_index=len(self.canvas_images) + len(self.text_items)
+        )
+        
+        graphic_text = DraggableTextItem(text_item, self)
+        x_px = cm_to_pixels(x_cm, self.canvas_dpi)
+        y_px = cm_to_pixels(y_cm, self.canvas_dpi)
+        graphic_text.setPos(x_px, y_px)
+        
+        self.scene.addItem(graphic_text)
+        self.text_items.append(text_item)
+        
+        # Auto-entrar en modo edición
+        graphic_text.enter_edit_mode()
+        
+        self.save_history_state()
+        self.statusBar().showMessage("Texto agregado - Doble click para editar", 3000)
+    
+    def get_selected_text_items(self):
+        """Obtener textos seleccionados"""
+        return [item for item in self.scene.selectedItems() if isinstance(item, DraggableTextItem)]
+    
+    def update_text_font(self, font):
+        """Actualizar fuente del texto seleccionado"""
+        selected = self.get_selected_text_items()
+        for item in selected:
+            item.text_item.font_family = font.family()
+            current_font = item.font()
+            current_font.setFamily(font.family())
+            item.setFont(current_font)
+        if selected:
+            self.save_history_state()
+    
+    def update_text_size(self, size):
+        """Actualizar tamaño del texto seleccionado"""
+        selected = self.get_selected_text_items()
+        for item in selected:
+            item.text_item.font_size = size
+            current_font = item.font()
+            current_font.setPointSize(size)
+            item.setFont(current_font)
+        if selected:
+            self.save_history_state()
+    
+    def choose_text_color(self):
+        """Elegir color de texto"""
+        selected = self.get_selected_text_items()
+        if not selected:
+            return
+        
+        color = QColorDialog.getColor()
+        if color.isValid():
+            for item in selected:
+                item.text_item.color = color.name()
+                item.setDefaultTextColor(color)
+            self.save_history_state()
+    
+    def toggle_text_bold(self):
+        """Toggle negrita"""
+        selected = self.get_selected_text_items()
+        for item in selected:
+            if item.text_item.font_weight == "bold":
+                item.text_item.font_weight = "normal"
+            else:
+                item.text_item.font_weight = "bold"
+            
+            current_font = item.font()
+            current_font.setBold(item.text_item.font_weight == "bold")
+            item.setFont(current_font)
+        if selected:
+            self.save_history_state()
+    
+    def toggle_text_italic(self):
+        """Toggle cursiva"""
+        selected = self.get_selected_text_items()
+        for item in selected:
+            if item.text_item.font_style == "italic":
+                item.text_item.font_style = "normal"
+            else:
+                item.text_item.font_style = "italic"
+            
+            current_font = item.font()
+            current_font.setItalic(item.text_item.font_style == "italic")
+            item.setFont(current_font)
+        if selected:
+            self.save_history_state()
+    
+    def toggle_text_underline(self):
+        """Toggle subrayado"""
+        selected = self.get_selected_text_items()
+        for item in selected:
+            item.text_item.underline = not item.text_item.underline
+            current_font = item.font()
+            current_font.setUnderline(item.text_item.underline)
+            item.setFont(current_font)
+        if selected:
+            self.save_history_state()
+    
+    def set_text_alignment(self, alignment):
+        """Establecer alineación de texto"""
+        selected = self.get_selected_text_items()
+        for item in selected:
+            item.text_item.alignment = alignment
+            item.apply_alignment()
+        if selected:
+            self.save_history_state()
+    
+    # Métodos auxiliares para menú contextual de texto
+    def toggle_text_bold_for_item(self, item):
+        """Toggle negrita para un item específico"""
+        if item.text_item.font_weight == "bold":
+            item.text_item.font_weight = "normal"
+        else:
+            item.text_item.font_weight = "bold"
+        
+        current_font = item.font()
+        current_font.setBold(item.text_item.font_weight == "bold")
+        item.setFont(current_font)
+        self.save_history_state()
+    
+    def toggle_text_italic_for_item(self, item):
+        """Toggle cursiva para un item específico"""
+        if item.text_item.font_style == "italic":
+            item.text_item.font_style = "normal"
+        else:
+            item.text_item.font_style = "italic"
+        
+        current_font = item.font()
+        current_font.setItalic(item.text_item.font_style == "italic")
+        item.setFont(current_font)
+        self.save_history_state()
+    
+    def toggle_text_underline_for_item(self, item):
+        """Toggle subrayado para un item específico"""
+        item.text_item.underline = not item.text_item.underline
+        current_font = item.font()
+        current_font.setUnderline(item.text_item.underline)
+        item.setFont(current_font)
+        self.save_history_state()
+    
+    def set_text_alignment_for_item(self, item, alignment):
+        """Establecer alineación para un item específico"""
+        item.text_item.alignment = alignment
+        item.apply_alignment()
+        self.save_history_state()
+    
+    def duplicate_text_item(self, item):
+        """Duplicar un texto"""
+        new_text = TextCanvasItem(
+            text=item.text_item.text,
+            x=item.text_item.x + 1.0,
+            y=item.text_item.y + 1.0,
+            width=item.text_item.width,
+            height=item.text_item.height,
+            font_family=item.text_item.font_family,
+            font_size=item.text_item.font_size,
+            font_weight=item.text_item.font_weight,
+            font_style=item.text_item.font_style,
+            color=item.text_item.color,
+            alignment=item.text_item.alignment,
+            underline=item.text_item.underline,
+            strikethrough=item.text_item.strikethrough,
+            rotation=item.text_item.rotation,
+            opacity=item.text_item.opacity,
+            z_index=len(self.canvas_images) + len(self.text_items)
+        )
+        
+        graphic_text = DraggableTextItem(new_text, self)
+        x_px = cm_to_pixels(new_text.x, self.canvas_dpi)
+        y_px = cm_to_pixels(new_text.y, self.canvas_dpi)
+        graphic_text.setPos(x_px, y_px)
+        
+        self.scene.addItem(graphic_text)
+        self.text_items.append(new_text)
+        self.save_history_state()
+        self.statusBar().showMessage("Texto duplicado", 2000)
+    
+    def delete_text_item(self, item):
+        """Eliminar un texto"""
+        self.scene.removeItem(item)
+        if item.text_item in self.text_items:
+            self.text_items.remove(item.text_item)
+        self.save_history_state()
+        self.statusBar().showMessage("Texto eliminado", 2000)
+    
     def recreate_canvas(self):
         """Recrear canvas con nueva configuración"""
         if "Personalizado" in self.size_combo.currentText():
@@ -2136,7 +3451,7 @@ class CanvasEditor(QMainWindow):
     
     def toggle_grid(self, state):
         """Mostrar/ocultar cuadrícula"""
-        self.show_grid = state == Qt.CheckState.Checked.value
+        self.show_grid = state == Qt.CheckState.Checked
         self.create_canvas()
         
         # Re-agregar todas las imágenes
@@ -2185,6 +3500,14 @@ class CanvasEditor(QMainWindow):
     def toggle_snap(self, state):
         """Activar/desactivar ajuste a cuadrícula"""
         self.snap_to_grid = state == Qt.CheckState.Checked.value
+    
+    def toggle_smart_guides(self, state):
+        """Activar/desactivar guías inteligentes"""
+        if hasattr(self, 'smart_guides'):
+            self.smart_guides.enabled = state == Qt.CheckState.Checked
+            # Limpiar guías si se desactivan
+            if not self.smart_guides.enabled:
+                self.smart_guides.clear_guides()
     
     def change_zoom(self, delta):
         """Cambiar zoom"""
@@ -2305,15 +3628,6 @@ class CanvasEditor(QMainWindow):
         else:
             image.save(output_path, format_name)
     
-    def wheelEvent(self, event):
-        """Zoom con rueda del mouse (Ctrl + Scroll)"""
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            delta = event.angleDelta().y()
-            zoom_delta = 0.1 if delta > 0 else -0.1
-            self.change_zoom(zoom_delta)
-            event.accept()
-        else:
-            super().wheelEvent(event)
     
     def closeEvent(self, event):
         """Guardar configuración al cerrar"""
