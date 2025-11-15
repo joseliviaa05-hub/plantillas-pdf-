@@ -468,6 +468,10 @@ class DraggableImageItem(QGraphicsPixmapItem):
             super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event):
+        # Limpiar guías smart cuando se suelta el objeto
+        if hasattr(self.canvas_editor, 'smart_guides'):
+            self.canvas_editor.smart_guides.clear_guides()
+        
         if self.is_rotating:
             # Finalizar rotación
             self.is_rotating = False
@@ -523,16 +527,23 @@ class DraggableImageItem(QGraphicsPixmapItem):
     def itemChange(self, change, value):
         # Snap to grid cuando se está moviendo el objeto
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            new_pos = value  # QPointF
+            
+            # Prioridad 1: Snap to grid si está habilitado
             if hasattr(self.canvas_editor, 'snap_to_grid') and self.canvas_editor.snap_to_grid:
-                # Snap a la cuadrícula
                 grid_size_cm = 1.0  # 1 cm de cuadrícula por defecto
                 grid_size_px = cm_to_pixels(grid_size_cm, self.canvas_editor.canvas_dpi)
                 
-                new_pos = value  # QPointF
                 snapped_x = round(new_pos.x() / grid_size_px) * grid_size_px
                 snapped_y = round(new_pos.y() / grid_size_px) * grid_size_px
                 
                 return QPointF(snapped_x, snapped_y)
+            
+            # Prioridad 2: Smart guides si no hay snap to grid
+            elif hasattr(self.canvas_editor, 'smart_guides') and not self.is_resizing and not self.is_rotating:
+                # Aplicar smart guides y snap
+                adjusted_pos = self.canvas_editor.smart_guides.detect_alignments(self, new_pos)
+                return adjusted_pos
         
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             # Actualizar posición en canvas_item
@@ -790,7 +801,16 @@ class DraggableTextItem(QGraphicsTextItem):
         painter.restore()
     
     def itemChange(self, change, value):
-        """Manejar cambios en el item"""
+        """Manejar cambios en el item con smart guides"""
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            new_pos = value  # QPointF
+            
+            # Aplicar smart guides si no está en modo edición
+            if not self.is_editing and hasattr(self.canvas_editor, 'smart_guides'):
+                # Smart guides y snap
+                adjusted_pos = self.canvas_editor.smart_guides.detect_alignments(self, new_pos)
+                return adjusted_pos
+        
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             if hasattr(self, 'text_item') and hasattr(self.canvas_editor, 'canvas_dpi'):
                 dpi = self.canvas_editor.canvas_dpi
@@ -1074,6 +1094,213 @@ class CustomGraphicsView(QGraphicsView):
         else:
             super().wheelEvent(event)
 
+# ==================== Smart Guides Manager ====================
+
+class SmartGuideManager:
+    """
+    Gestor de guías inteligentes para alineación automática estilo Canva/Figma
+    
+    Características:
+    - Detecta alineación entre objetos al mover
+    - Muestra guías visuales temporales
+    - Aplica snap suave para alineación precisa
+    """
+    
+    def __init__(self, scene, canvas_editor):
+        self.scene = scene
+        self.canvas_editor = canvas_editor
+        
+        # Líneas de guía activas
+        self.guide_lines: List[QGraphicsLineItem] = []
+        
+        # Configuración
+        self.snap_threshold = 8  # Umbral en píxeles para snap
+        self.guide_color = QColor(255, 77, 212)  # #ff4dd4 (fucsia Canva)
+        self.guide_opacity = 0.6
+        self.guide_width = 1.5
+        
+        # Estado
+        self.enabled = True
+    
+    def clear_guides(self):
+        """Eliminar todas las guías visibles"""
+        for line in self.guide_lines:
+            self.scene.removeItem(line)
+        self.guide_lines.clear()
+    
+    def draw_vertical_guide(self, x: float):
+        """Dibujar guía vertical en posición x"""
+        # Obtener límites del canvas
+        canvas_rect = self.scene.sceneRect()
+        
+        # Crear línea vertical
+        line = QGraphicsLineItem(x, canvas_rect.top(), x, canvas_rect.bottom())
+        
+        # Estilo de la guía
+        pen = QPen(self.guide_color, self.guide_width)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        line.setPen(pen)
+        line.setOpacity(self.guide_opacity)
+        
+        # No seleccionable y siempre al frente
+        line.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        line.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        line.setZValue(99999)  # Siempre visible
+        
+        self.scene.addItem(line)
+        self.guide_lines.append(line)
+    
+    def draw_horizontal_guide(self, y: float):
+        """Dibujar guía horizontal en posición y"""
+        # Obtener límites del canvas
+        canvas_rect = self.scene.sceneRect()
+        
+        # Crear línea horizontal
+        line = QGraphicsLineItem(canvas_rect.left(), y, canvas_rect.right(), y)
+        
+        # Estilo de la guía
+        pen = QPen(self.guide_color, self.guide_width)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        line.setPen(pen)
+        line.setOpacity(self.guide_opacity)
+        
+        # No seleccionable y siempre al frente
+        line.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        line.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        line.setZValue(99999)
+        
+        self.scene.addItem(line)
+        self.guide_lines.append(line)
+    
+    def get_item_bounds(self, item):
+        """Obtener bordes y centro de un item"""
+        if isinstance(item, (DraggableImageItem, DraggableTextItem)):
+            rect = item.sceneBoundingRect()
+            return {
+                'left': rect.left(),
+                'right': rect.right(),
+                'top': rect.top(),
+                'bottom': rect.bottom(),
+                'center_x': rect.center().x(),
+                'center_y': rect.center().y(),
+                'rect': rect
+            }
+        return None
+    
+    def detect_alignments(self, moving_item, new_pos):
+        """
+        Detectar alineaciones potenciales y aplicar snap
+        
+        Returns:
+            QPointF con posición ajustada por snap
+        """
+        if not self.enabled:
+            return new_pos
+        
+        # Limpiar guías previas
+        self.clear_guides()
+        
+        # Obtener bounds del item en movimiento en su nueva posición
+        moving_rect = moving_item.sceneBoundingRect()
+        offset = new_pos - moving_item.pos()
+        moving_rect.translate(offset)
+        
+        moving_bounds = {
+            'left': moving_rect.left(),
+            'right': moving_rect.right(),
+            'top': moving_rect.top(),
+            'bottom': moving_rect.bottom(),
+            'center_x': moving_rect.center().x(),
+            'center_y': moving_rect.center().y(),
+        }
+        
+        # Canvas center para alineación con canvas
+        canvas_rect = self.scene.sceneRect()
+        canvas_center_x = canvas_rect.center().x()
+        canvas_center_y = canvas_rect.center().y()
+        
+        # Variables para snap
+        snap_x = None
+        snap_y = None
+        
+        # Verificar alineación con canvas
+        if abs(moving_bounds['center_x'] - canvas_center_x) < self.snap_threshold:
+            snap_x = canvas_center_x - (moving_rect.center().x() - moving_rect.left()) + (moving_rect.width() / 2)
+            self.draw_vertical_guide(canvas_center_x)
+        
+        if abs(moving_bounds['center_y'] - canvas_center_y) < self.snap_threshold:
+            snap_y = canvas_center_y - (moving_rect.center().y() - moving_rect.top()) + (moving_rect.height() / 2)
+            self.draw_horizontal_guide(canvas_center_y)
+        
+        # Verificar alineación con otros items
+        for item in self.scene.items():
+            if item == moving_item:
+                continue
+            
+            # Solo considerar items movibles (imágenes y textos)
+            if not isinstance(item, (DraggableImageItem, DraggableTextItem)):
+                continue
+            
+            other_bounds = self.get_item_bounds(item)
+            if not other_bounds:
+                continue
+            
+            # Alineación de centros
+            if snap_x is None and abs(moving_bounds['center_x'] - other_bounds['center_x']) < self.snap_threshold:
+                snap_x = other_bounds['center_x'] - (moving_rect.center().x() - moving_rect.left()) + (moving_rect.width() / 2)
+                self.draw_vertical_guide(other_bounds['center_x'])
+            
+            if snap_y is None and abs(moving_bounds['center_y'] - other_bounds['center_y']) < self.snap_threshold:
+                snap_y = other_bounds['center_y'] - (moving_rect.center().y() - moving_rect.top()) + (moving_rect.height() / 2)
+                self.draw_horizontal_guide(other_bounds['center_y'])
+            
+            # Alineación de bordes
+            # Left edge alignment
+            if snap_x is None and abs(moving_bounds['left'] - other_bounds['left']) < self.snap_threshold:
+                snap_x = other_bounds['left']
+                self.draw_vertical_guide(other_bounds['left'])
+            
+            # Right edge alignment
+            if snap_x is None and abs(moving_bounds['right'] - other_bounds['right']) < self.snap_threshold:
+                snap_x = other_bounds['right'] - moving_rect.width()
+                self.draw_vertical_guide(other_bounds['right'])
+            
+            # Top edge alignment
+            if snap_y is None and abs(moving_bounds['top'] - other_bounds['top']) < self.snap_threshold:
+                snap_y = other_bounds['top']
+                self.draw_horizontal_guide(other_bounds['top'])
+            
+            # Bottom edge alignment
+            if snap_y is None and abs(moving_bounds['bottom'] - other_bounds['bottom']) < self.snap_threshold:
+                snap_y = other_bounds['bottom'] - moving_rect.height()
+                self.draw_horizontal_guide(other_bounds['bottom'])
+            
+            # Alineación cruzada (centro de uno con borde de otro)
+            if snap_x is None and abs(moving_bounds['center_x'] - other_bounds['left']) < self.snap_threshold:
+                snap_x = other_bounds['left'] - (moving_rect.center().x() - moving_rect.left()) + (moving_rect.width() / 2)
+                self.draw_vertical_guide(other_bounds['left'])
+            
+            if snap_x is None and abs(moving_bounds['center_x'] - other_bounds['right']) < self.snap_threshold:
+                snap_x = other_bounds['right'] - (moving_rect.center().x() - moving_rect.left()) + (moving_rect.width() / 2)
+                self.draw_vertical_guide(other_bounds['right'])
+            
+            if snap_y is None and abs(moving_bounds['center_y'] - other_bounds['top']) < self.snap_threshold:
+                snap_y = other_bounds['top'] - (moving_rect.center().y() - moving_rect.top()) + (moving_rect.height() / 2)
+                self.draw_horizontal_guide(other_bounds['top'])
+            
+            if snap_y is None and abs(moving_bounds['center_y'] - other_bounds['bottom']) < self.snap_threshold:
+                snap_y = other_bounds['bottom'] - (moving_rect.center().y() - moving_rect.top()) + (moving_rect.height() / 2)
+                self.draw_horizontal_guide(other_bounds['bottom'])
+        
+        # Aplicar snap si se detectó
+        result_pos = QPointF(new_pos)
+        if snap_x is not None:
+            result_pos.setX(snap_x)
+        if snap_y is not None:
+            result_pos.setY(snap_y)
+        
+        return result_pos
+
 # ==================== Canvas Principal ====================
 
 class CanvasEditor(QMainWindow):
@@ -1289,8 +1516,14 @@ class CanvasEditor(QMainWindow):
         self.snap_check.stateChanged.connect(self.toggle_snap)
         self.apply_checkbox_style(self.snap_check)
         
+        self.smart_guides_check = QCheckBox("Guías inteligentes")
+        self.smart_guides_check.setChecked(True)  # Activado por defecto
+        self.smart_guides_check.stateChanged.connect(self.toggle_smart_guides)
+        self.apply_checkbox_style(self.smart_guides_check)
+        
         view_layout.addWidget(self.grid_check)
         view_layout.addWidget(self.snap_check)
+        view_layout.addWidget(self.smart_guides_check)
         view_group.setLayout(view_layout)
         
         # Ensamblar panel izquierdo
@@ -1339,6 +1572,10 @@ class CanvasEditor(QMainWindow):
         
         # Graphics View para el canvas (usando vista personalizada)
         self.scene = QGraphicsScene()
+        
+        # Inicializar Smart Guides Manager
+        self.smart_guides = SmartGuideManager(self.scene, self)
+        
         self.view = CustomGraphicsView(self.scene, self)
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -3251,6 +3488,14 @@ class CanvasEditor(QMainWindow):
     def toggle_snap(self, state):
         """Activar/desactivar ajuste a cuadrícula"""
         self.snap_to_grid = state == Qt.CheckState.Checked.value
+    
+    def toggle_smart_guides(self, state):
+        """Activar/desactivar guías inteligentes"""
+        if hasattr(self, 'smart_guides'):
+            self.smart_guides.enabled = state == Qt.CheckState.Checked
+            # Limpiar guías si se desactivan
+            if not self.smart_guides.enabled:
+                self.smart_guides.clear_guides()
     
     def change_zoom(self, delta):
         """Cambiar zoom"""
